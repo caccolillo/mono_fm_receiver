@@ -17,7 +17,7 @@
 %
 % Post-sim: resample 50k->48k, normalise, sound() + audiowrite()
 %
-% Marco Aiello, 2024
+
 
 clear; clc;
 mdl = 'fm_demod_slx';

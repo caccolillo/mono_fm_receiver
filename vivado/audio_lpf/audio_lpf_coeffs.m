@@ -3,7 +3,7 @@
 % 127-tap FIR, 50 kHz sample rate, sfix32_En14 I/O.
 % Matches Simulink Discrete FIR Filter block parameters exactly.
 %
-% Marco Aiello, 2024
+
 
 % Coefficients from Simulink block (127 taps)
 h = [1.10630118570443e-05 -1.08432976692692e-05 -1.59142086028176e-05 ...

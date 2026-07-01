@@ -17,7 +17,7 @@
 % The on-chip nco_0 (DDS Compiler v6.0, +10 kHz) generates its own cos/sin
 % internally during simulation -- no NCO stimulus file is needed here.
 %
-% Marco Aiello, 2024
+
 
 clc; clear;
 

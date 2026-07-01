@@ -11,7 +11,7 @@
 % base workspace -- this script will attempt to load it, falling back to
 % fm_audio_fixed.wav if needed.
 %
-% Marco Aiello, 2024
+
 
 clc; clear;
 

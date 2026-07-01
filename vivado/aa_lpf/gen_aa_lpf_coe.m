@@ -23,7 +23,7 @@
 %         aa_lpf_q_stimulus.txt       (Q-channel HLS testbench stimulus)
 %         aa_lpf_q_golden.txt         (Q-channel HLS testbench golden)
 %
-% Marco Aiello, 2024 (Updated 2026: single-channel HLS, separate I/Q files)
+
 
 fprintf('=== Generating AA LPF coefficient file and HLS assets ===\n');
 

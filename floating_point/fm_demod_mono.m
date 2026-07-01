@@ -18,7 +18,7 @@
 % Usage:
 %   Place rds.wav in the current folder, then run:  fm_demod_mono
 %
-% Marco Aiello, 2024
+
 
 clear; close all; clc;
 

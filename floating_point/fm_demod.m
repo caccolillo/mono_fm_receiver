@@ -22,7 +22,7 @@
 %   3.  The script plays stereo audio on your default soundcard and saves
 %       fm_audio_stereo.wav (48 kHz, 16-bit, stereo) in the same folder.
 %
-% Marco Aiello, 2024
+
 
 clear; close all; clc;
 

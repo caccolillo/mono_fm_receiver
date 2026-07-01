@@ -2,7 +2,7 @@
 % Generates the FIR Compiler coefficient file for the decimation filter.
 % fir1(40, 1/5), quantised to sfix32_En14 (same as input/output).
 %
-% Marco Aiello, 2024
+
 
 h = fir1(40, 1/5);
 

@@ -14,7 +14,7 @@
 %   - DeEmph accum: fixdt(1,40,14)  covers DC gain 4.27 x max input
 %   - Inputs      : fixdt(1,16,15)  matches 16-bit ADC
 %
-% Marco Aiello, 2024
+
 
 clc; clear;
 

@@ -2,7 +2,7 @@
 % Impulse test for Audio LPF (127-tap FIR, no decimation, 50 kHz).
 % Output should be the 127 filter coefficients (quantised to sfix32_En14).
 %
-% Marco Aiello, 2024
+
 
 fprintf('=== Generating Audio LPF impulse test ===\n');
 

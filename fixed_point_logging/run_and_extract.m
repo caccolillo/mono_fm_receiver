@@ -16,7 +16,7 @@
 %   - <stage>_golden.txt          signed integer vectors for each probe
 %   - input_[i|q|cos|sin]_stimulus.txt  input stimulus vectors
 %
-% Marco Aiello, 2024
+
 
 clc; clear all;
 % clear all ensures no stale workspace variables from previous runs.

@@ -3,7 +3,7 @@
 % With decimation R=5, the impulse response gives filter coefficients at
 % positions 4, 9, 14, 19, 24, 29, 34, 39 (every 5th, starting at R-1=4).
 %
-% Marco Aiello, 2024
+
 
 fprintf('=== Generating FIR Decimator impulse test ===\n');
 

@@ -8,7 +8,7 @@
 %   out   = phase * r2Hz           [sfix32_En14]
 %   r2Hz  = 250000 / (2*pi) = 39788.7358
 %
-% Marco Aiello, 2024
+
 
 fprintf('=== Generating FM Discriminator test vectors ===\n');
 

@@ -2,7 +2,7 @@
 % Generates stimulus and golden for the de-emphasis IIR testbench.
 % Uses a step input (easiest to verify IIR steady state) and impulse.
 %
-% Marco Aiello, 2024
+
 
 fprintf('=== Generating De-emphasis test vectors ===\n');
 
