@@ -1,0 +1,20 @@
+srcscan starts
+=============== Using vdb files for VHDL std libs ===========
+INFO: VHDL library search path for library "std" is now "/home/caccolillo/Xilinx_2022_2/Vivado/2022.2/data/precomp_hsv/vhdl/std_2008" (VHDL-1505)
+INFO: VHDL library search path for library "synopsys" is now "/home/caccolillo/Xilinx_2022_2/Vivado/2022.2/data/precomp_hsv/vhdl/synopsys_2008" (VHDL-1505)
+INFO: VHDL library search path for library "ieee" is now "/home/caccolillo/Xilinx_2022_2/Vivado/2022.2/data/precomp_hsv/vhdl/ieee_2008" (VHDL-1505)
+INFO: VHDL library search path for library "unimacro" is now "/home/caccolillo/Xilinx_2022_2/Vivado/2022.2/data/precomp_hsv/vhdl/unimacro_2008" (VHDL-1505)
+INFO: VHDL library search path for library "unisim" is now "/home/caccolillo/Xilinx_2022_2/Vivado/2022.2/data/precomp_hsv/vhdl/unisim_2008" (VHDL-1505)
+INFO: VHDL library search path for library "vl" is now "/home/caccolillo/Xilinx_2022_2/Vivado/2022.2/data/precomp_hsv/vhdl/vl_2008" (VHDL-1505)
+INFO: VHDL library search path for library "xpm" is now "/home/caccolillo/Xilinx_2022_2/Vivado/2022.2/data/precomp_hsv/vhdl/xpm_2008" (VHDL-1505)
+-- Analyzing VHDL file "/home/caccolillo/FM_RECEIVER/vivado/aa_lpf/aa_lpf_wrapper.vhd" into library xil_defaultlib (VHDL-9003)
+INFO: analyzing entity 'aa_lpf_wrapper' (VHDL-1012)
+INFO: analyzing architecture 'rtl' of entity 'aa_lpf_wrapper' (VHDL-9006)
+/home/caccolillo/FM_RECEIVER/vivado/aa_lpf/aa_lpf_wrapper.vhd(80): ERROR: 'fir_compiler_0' is not compiled in library 'xil_defaultlib' (VHDL-1240)
+/home/caccolillo/FM_RECEIVER/vivado/aa_lpf/aa_lpf_wrapper.vhd(94): ERROR: 'fir_compiler_0' is not compiled in library 'xil_defaultlib' (VHDL-1240)
+Listing tops:
+VHDLTop: library:xil_defaultlib entity:aa_lpf_wrapper arch:
+VHDLTop: library:xil_defaultlib entity:aa_lpf_wrapper arch:
+END of tops
+/home/caccolillo/FM_RECEIVER/vivado/aa_lpf/aa_lpf_wrapper.vhd(19): INFO: processing 'aa_lpf_wrapper_default(rtl)' (VHDL-1067)
+srcscan exits with return value 0
