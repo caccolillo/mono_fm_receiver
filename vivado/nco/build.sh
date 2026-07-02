@@ -13,7 +13,7 @@
 #   - input_nco_sin_stimulus.txt in current dir  (from run_and_extract.m)
 #   - tb_nco.vhd in current dir
 #
-# Marco Aiello, 2024
+
 
 set -e
 
@@ -61,13 +61,8 @@ fi
 mkdir -p "${PROJ_DIR}"
 
 echo ""
-echo "Launching Vivado GUI..."
-echo "When it opens:"
-echo "  Flow Navigator -> Simulation -> Run Simulation -> Run Behavioural Simulation"
-echo "  Check Tcl console for PASS / FAIL verdict"
+echo "Launching Vivado ..."
 echo ""
 
-# Launch Vivado in GUI mode, source the setup TCL, then stay open
-vivado -mode gui \
-       -source "${TCL_SCRIPT}" \
-       -tclargs "${PROJ_DIR}" "${SCRIPT_DIR}"
+# Launch Vivado in batch mode, source the setup TCL, then stay open
+vivado -mode batch -source "${TCL_SCRIPT}" -tclargs "${PROJ_DIR}"

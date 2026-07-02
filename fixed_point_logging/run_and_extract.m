@@ -426,6 +426,7 @@ fprintf('=== Done ===\n');
 vivado_dirs = {
     '../vivado/aa_lpf/'
     '../vivado/freq_corr/'
+    '../vivado/nco/'
 };
 all_vecs = {
     'freqcorr_i_golden.txt', 'freqcorr_q_golden.txt', ...
