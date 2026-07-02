@@ -8,3 +8,8 @@
 *proj*
 *prj*
 *.slxc
+*fm_audio_fixed.wav
+*fm_audio_mono.wav
+*fm_audio_simulink.wav
+*fm_audio_stereo.wav
+*coefficients.h
