@@ -4,11 +4,11 @@
 #
 # Usage: vivado -mode batch -source create_fir_dec_ip.tcl
 #
-# Marco Aiello, 2024
+
 
 set proj_name fir_dec_proj
 set proj_dir  [pwd]/fir_dec_proj
-set part      xc7z020clg400-1
+set part      xc7z010clg400-1
 set coe_file  [pwd]/fir_dec.coe
 
 # Verify .coe file exists

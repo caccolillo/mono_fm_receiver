@@ -4,11 +4,11 @@
 #
 # Usage: vivado -mode batch -source create_audio_lpf_ip.tcl
 #
-# Marco Aiello, 2024
+
 
 set proj_name audio_lpf_proj
 set proj_dir  [pwd]/audio_lpf_proj
-set part      xc7z020clg400-1
+set part      xc7z010clg400-1
 set coe_file  [pwd]/audio_lpf.coe
 
 if {![file exists $coe_file]} {

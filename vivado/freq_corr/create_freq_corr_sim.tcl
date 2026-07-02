@@ -5,7 +5,7 @@
 #   vivado -mode gui -source create_freq_corr_sim.tcl \
 #          -tclargs <proj_dir> <script_dir>
 #
-# Marco Aiello, 2024
+
 
 if {[llength $argv] >= 2} {
     set proj_dir   [lindex $argv 0]
@@ -16,7 +16,7 @@ if {[llength $argv] >= 2} {
 }
 
 set proj_name "freq_corr"
-set part      "xc7z020clg400-1"
+set part      "xc7z010clg400-1"
 
 puts "=== Freq Corr Project Setup ==="
 puts "Project : ${proj_dir}/${proj_name}"

@@ -12,7 +12,7 @@
 # Usage (from within the fm_demod project directory, or pass proj_dir):
 #   vivado -mode batch -source run_fm_demod_chain_sim.tcl -tclargs <proj_dir> <script_dir>
 #
-# Marco Aiello, 2024
+
 
 if {[llength $argv] >= 2} {
     set proj_dir   [lindex $argv 0]

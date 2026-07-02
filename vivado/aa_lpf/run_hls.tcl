@@ -16,8 +16,8 @@ add_files -tb aa_lpf_i_stimulus.txt
 add_files -tb aa_lpf_i_golden.txt
 # Solution environment initializing
 open_solution -reset "solution1"
-# Target Definition: Zybo Z7-20 (xc7z020clg400-1)
-set_part {xc7z020clg400-1}
+# Target Definition: Zybo Z7-10 (xc7z010clg400-1)
+set_part {xc7z010clg400-1}
 create_clock -period 10 -name default
 # Processing Commands Flow
 puts "--- Launching Functional C Simulation ---"
