@@ -242,6 +242,13 @@ S_fc  = double(ts_nco_sin.Data(1:N_fc));
 ic_gold = I_fc .* C_fc - Q_fc .* S_fc;   % Ic = I*cos - Q*sin
 qc_gold = I_fc .* S_fc + Q_fc .* C_fc;   % Qc = I*sin + Q*cos
 
+% Save ic_gold and qc_gold to the same directory as this script so
+% gen_fm_disc_vectors can find them regardless of MATLAB's current pwd.
+run_and_extract_dir = fileparts(mfilename('fullpath'));
+mat_save_path = fullfile(run_and_extract_dir, 'ic_qc_gold.mat');
+save(mat_save_path, 'ic_gold', 'qc_gold');
+fprintf('Saved: %s (ic_gold, qc_gold, %d samples)\n', mat_save_path, length(ic_gold));
+
 fm_fc = fimath('RoundingMethod','Round','OverflowAction','Saturate');
 ic_fi = double(storedInteger(fi(ic_gold, 1, 18, 17, fm_fc)));
 qc_fi = double(storedInteger(fi(qc_gold, 1, 18, 17, fm_fc)));
