@@ -191,14 +191,5 @@ ipx::save_core           $ip
 set_property ip_repo_paths ${script_dir}/ip_repo [current_project]
 update_ip_catalog -rebuild
 puts "--- IP packaged and added to catalogue ---"
-
-# ── 6. Report ─────────────────────────────────────────────────────────────
-puts "\n=== Project ready ==="
-puts "To simulate:"
-puts "  Flow Navigator -> Simulation -> Run Simulation -> Run Behavioural Simulation"
-puts "  Check Tcl console for PASS / FAIL"
-puts "  DUT outputs: ${xsim_dir}/nco_cos_dut_output.txt"
-puts "               ${xsim_dir}/nco_sin_dut_output.txt"
-puts ""
-puts "NCO IP location: ${script_dir}/ip_repo/nco_v1_0"
-puts "Add to other projects: Tools->Settings->IP->Repository->${script_dir}/ip_repo"
+# Close the project and exit cleanly
+close_project

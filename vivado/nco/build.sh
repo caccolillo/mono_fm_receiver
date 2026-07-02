@@ -1,7 +1,6 @@
 #!/bin/bash
 # run_nco_sim.sh
-# Creates the Vivado project for NCO simulation and opens the GUI.
-# Run simulation manually from Flow Navigator inside Vivado.
+# Creates the Vivado project for NCO simulation and runs it in batch mode.
 #
 # Usage:
 #   chmod +x run_nco_sim.sh
@@ -13,7 +12,6 @@
 #   - input_nco_sin_stimulus.txt in current dir  (from run_and_extract.m)
 #   - tb_nco.vhd in current dir
 #
-
 
 set -e
 
@@ -61,8 +59,9 @@ fi
 mkdir -p "${PROJ_DIR}"
 
 echo ""
-echo "Launching Vivado ..."
+echo "Launching Vivado in batch mode..."
 echo ""
 
-# Launch Vivado in batch mode, source the setup TCL, then stay open
-vivado -mode batch -source "${TCL_SCRIPT}" -tclargs "${PROJ_DIR}"
+# FIXED: Passed both ${PROJ_DIR} AND ${SCRIPT_DIR} to -tclargs
+vivado -mode batch -source "${TCL_SCRIPT}" -tclargs "${PROJ_DIR}" "${SCRIPT_DIR}"
+
