@@ -27,7 +27,7 @@
 clear; close all; clc;
 
 %% ── USER PARAMETERS ──────────────────────────────────────────────────────
-WAV_FILE      = 'SDRuno_20200907_184033Z_88110kHz.wav';   % path to the SDRplay IQ recording
+WAV_FILE      = 'rds.wav';   % path to the SDRplay IQ recording
 CARRIER_OFFSET = -10e3;       % Hz  – station offset from LO (+10 kHz shift needed)
 FS_AUDIO      = 48e3;         % Hz  – output audio sample rate
 DEEMPH_TAU    = 75e-6;        % s   – 75 µs for US FM, use 50e-6 for European

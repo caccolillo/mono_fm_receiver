@@ -1,0 +1,10 @@
+*.txt
+*.log
+*.jou
+*.str
+*.coe
+*.mat
+*.png
+*proj*
+*prj*
+*.slxc
