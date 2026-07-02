@@ -9,7 +9,7 @@ add_files -tb fm_disc_qc_stimulus.txt
 add_files -tb fm_disc_golden.txt
 
 open_solution -reset "solution1"
-set_part {xc7z010clg400-1}
+set_part {xc7z020clg400-1}
 create_clock -period 10 -name default
 
 puts "--- C Simulation ---"

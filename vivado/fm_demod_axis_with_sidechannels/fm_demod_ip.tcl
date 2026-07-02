@@ -14,10 +14,10 @@
 # Usage: vivado -mode batch -source fm_demod_ip.tcl
 #
 
-# Project identifiers and target part (Zybo Z7-10)
+# Project identifiers and target part (Zybo Z7-20)
 set proj_name fm_demod_axissidechannels_proj
 set proj_dir  [pwd]/fm_demod_proj
-set part      xc7z010clg400-1
+set part      xc7z020clg400-1
 
 # Fresh project, overwriting any previous run in the same directory
 create_project -force ${proj_name} ${proj_dir} -part ${part}

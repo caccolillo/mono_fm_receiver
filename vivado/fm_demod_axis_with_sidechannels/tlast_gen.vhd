@@ -77,4 +77,4 @@ begin
         end if;
     end process;
 
-end architecture tlast_gen;
+end architecture rtl;

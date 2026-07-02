@@ -424,7 +424,6 @@ fprintf('=== Done ===\n');
 
 %% ── STEP 8: Copy vector files to Vivado project directories ──────────────
 vivado_dirs = {
-    '../vivado/aa_lpf/'
     '../vivado/freq_corr/'
     '../vivado/nco/'
 };
