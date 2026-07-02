@@ -5,6 +5,7 @@
 *.coe
 *.mat
 *.png
+*.rpt
 *proj*
 *prj*
 *.slxc
@@ -13,3 +14,5 @@
 *fm_audio_simulink.wav
 *fm_audio_stereo.wav
 *coefficients.h
+*_repo*
+*_sim*

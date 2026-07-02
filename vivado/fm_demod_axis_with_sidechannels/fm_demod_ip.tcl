@@ -14,9 +14,8 @@
 # Usage: vivado -mode batch -source fm_demod_ip.tcl
 #
 
-
 # Project identifiers and target part (Zybo Z7-10)
-set proj_name fm_demod_proj
+set proj_name fm_demod_axissidechannels_proj
 set proj_dir  [pwd]/fm_demod_proj
 set part      xc7z010clg400-1
 
@@ -27,6 +26,10 @@ create_project -force ${proj_name} ${proj_dir} -part ${part}
 # is SystemVerilog. Mixed-language simulation requires this set so xsim
 # elaborates both without complaint.
 set_property simulator_language Mixed [current_project]
+
+# Add VHDL source files used to build block design
+add_files -norecurse iq_splitter.vhd
+add_files -norecurse tlast_gen.vhd
 
 # Point Vivado at the local IP repository (one level up) where each
 # sub-block's packaged IP lives, then rescan so they appear in the
@@ -45,12 +48,61 @@ update_compile_order -fileset sources_1
 # wiring can be edited/regenerated independently of this top-level script.
 source bd.tcl
 
-# Generate a synthesizable Verilog wrapper around the block design so it
-# can be used as (or instantiated within) a top-level design for
-# synthesis and bitstream generation.
-make_wrapper -files [get_files ./fm_demod_proj/fm_demod_proj.srcs/sources_1/bd/fm_demod/fm_demod.bd] -top
+# ── Generate Block Design Wrapper & Set as Top ─────────────────────────────
+# Get the block design handle dynamically
+set bd_file [get_files ${proj_dir}/${proj_name}.srcs/sources_1/bd/design_1/design_1.bd]
 
-# Add the generated wrapper to the project sources.
-add_files -norecurse ./fm_demod_proj/fm_demod_proj.gen/sources_1/bd/fm_demod/hdl/fm_demod_wrapper.v
+# Generate a synthesizable Verilog wrapper around the block design
+make_wrapper -files $bd_file -top
 
+# Target the newly generated file location inside the .gen directory structure
+set wrapper_file "${proj_dir}/${proj_name}.gen/sources_1/bd/design_1/hdl/design_1_wrapper.v"
+add_files -norecurse $wrapper_file
+
+# Re-evaluate the project structure to include the new file
+update_compile_order -fileset sources_1
+
+# Explicitly force the project to use the wrapper as its top file
+set_property top design_1_wrapper [current_fileset]
+update_compile_order -fileset sources_1
+
+
+# ── Package FM Demod Block Design As A Vivado IP ───────────────────────────
+# Packages the fm_demod block design (wrapper + BD sources) as a reusable
+# Vivado IP so it can be instantiated in a top-level design alongside the
+# Zynq PS block, AXI DMA, and supporting infrastructure.
+#
+# The packaged IP lands in ${proj_dir}/ip_repo/ and can be added to any
+# Vivado IP repository via:
+#   set_property ip_repo_paths <path_to_ip_repo> [current_project]
+#   update_ip_catalog
+
+puts "\n=== Packaging FM demodulator block design as Vivado IP ==="
+
+ipx::package_project \
+    -root_dir     ${proj_dir}/ip_repo \
+    -vendor       Marco_Aiello \
+    -library      user \
+    -taxonomy     /UserIP \
+    -import_files \
+    -set_current  false
+
+# Open the freshly packaged core and set metadata
+set core [ipx::find_open_core Marco_Aiello:user:fm_demod:1.0]
+if { $core eq "" } {
+    set core [ipx::open_core ${proj_dir}/ip_repo/component.xml]
+}
+
+set_property name         fm_demod_axis_with_sidechannels                                    $core
+set_property version      1.0                                         $core
+set_property display_name "FM Demodulator with side channels(full chain)"               $core
+set_property description  "Complete FM mono demodulator: NCO, FreqCorr, AA LPF x2, FM Discriminator, FIR Decimator R=5, Audio LPF, De-emphasis. sfix16_En15 I/Q input, sfix32_En13 audio output, 250 kHz / 50 kHz sample rates, AXI-Stream I/O, Zybo Z7 (xc7z010clg400-1)." $core
+set_property company_url  "" $core
+
+ipx::save_core $core
+
+puts "=== FM demodulator IP packaged to: ${proj_dir}/ip_repo ==="
+puts "=== Add that path to your top-level project IP repository to use it ==="
+
+exit
 
