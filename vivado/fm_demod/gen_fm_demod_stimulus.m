@@ -19,8 +19,6 @@
 %
 
 
-clc; clear;
-
 %% ── PARAMETERS (must match convert_fp_designer.m) ───────────────────────
 WAV_FILE    = 'rds.wav';
 FS_IQ       = 250e3;

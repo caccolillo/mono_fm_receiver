@@ -13,9 +13,35 @@
 fprintf('=== Generating FM Discriminator test vectors ===\n');
 
 % Use FreqCorr output from run_and_extract workspace
-% ic_gold and qc_gold are the AA LPF inputs (FreqCorr outputs)
+% ic_gold and qc_gold are the AA LPF inputs (FreqCorr outputs).
+% If not in workspace, search common locations for the .mat file saved by
+% run_and_extract.m (which writes it to its own working directory).
 if ~exist('ic_gold','var') || ~exist('qc_gold','var')
-    error('Run run_and_extract.m first to populate ic_gold and qc_gold.');
+    mat_fname = 'ic_qc_gold.mat';
+    % Search candidate directories: current dir, script dir, and common project roots
+    script_dir = fileparts(mfilename('fullpath'));
+    candidates = { ...
+        fullfile(pwd,         mat_fname), ...
+        fullfile(script_dir,  mat_fname), ...
+        fullfile(script_dir, '..', mat_fname), ...
+        fullfile(script_dir, '..', '..', mat_fname), ...
+        fullfile(script_dir, '..', '..', 'fixed_point_logging', mat_fname) };
+    mat_path = '';
+    for k = 1:numel(candidates)
+        if isfile(candidates{k})
+            mat_path = candidates{k};
+            break;
+        end
+    end
+    if ~isempty(mat_path)
+        fprintf('Loading ic_gold and qc_gold from %s ...\n', mat_path);
+        load(mat_path, 'ic_gold', 'qc_gold');
+    else
+        error(['ic_gold and qc_gold not found in workspace and %s could not ' ...
+               'be located in any of the candidate directories:\n%s\n' ...
+               'Run run_and_extract.m first to generate the .mat file.'], ...
+              mat_fname, strjoin(candidates, '\n'));
+    end
 end
 
 N = min(500, length(ic_gold));  % 500 samples is plenty for verification
