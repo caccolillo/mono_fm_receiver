@@ -15,9 +15,15 @@
 #
 
 # Project identifiers and target part (Zybo Z7-20)
-set proj_name fm_demod_axissidechannels_proj
-set proj_dir  [pwd]/fm_demod_proj
-set part      xc7z020clg400-1
+set proj_name  fm_demod_axissidechannels_proj
+set proj_dir   [pwd]/fm_demod_proj
+set part       xc7z020clg400-1
+# script_dir: directory containing all source files (passed via -tclargs)
+if { [llength $argv] >= 1 } {
+    set script_dir [lindex $argv 0]
+} else {
+    set script_dir [pwd]
+}
 
 # Fresh project, overwriting any previous run in the same directory
 create_project -force ${proj_name} ${proj_dir} -part ${part}
@@ -65,6 +71,70 @@ update_compile_order -fileset sources_1
 # Explicitly force the project to use the wrapper as its top file
 set_property top design_1_wrapper [current_fileset]
 update_compile_order -fileset sources_1
+
+##################################################################
+# AXI4-STREAM VIP TESTBENCH -- stall detection
+##################################################################
+# Adds two AXI4-Stream VIP instances to the block design (one master
+# driving s, one slave monitoring m), generates a SystemVerilog testbench
+# that injects I/Q beats and checks neither bus stalls for more than
+# STALL_TIMEOUT consecutive cycles.
+
+set tb_vip "${script_dir}/tb_fm_demod_axis_vip.sv"
+if { [file exists $tb_vip] } {
+    # Add VIP IPs to block design
+    open_bd_design [get_files design_1.bd]
+
+    # Master VIP: drives s (32-bit slave input)
+    create_ip -name axi4stream_vip -vendor xilinx.com -library ip \
+              -version 1.1 -module_name axi4stream_vip_0
+    set_property -dict [list \
+        CONFIG.INTERFACE_MODE  {MASTER} \
+        CONFIG.TDATA_NUM_BYTES {4} \
+        CONFIG.HAS_TREADY      {1} \
+        CONFIG.HAS_TLAST       {1} \
+    ] [get_ips axi4stream_vip_0]
+
+    # Slave VIP: monitors m (32-bit master output)
+    create_ip -name axi4stream_vip -vendor xilinx.com -library ip \
+              -version 1.1 -module_name axi4stream_vip_1
+    set_property -dict [list \
+        CONFIG.INTERFACE_MODE  {SLAVE} \
+        CONFIG.TDATA_NUM_BYTES {4} \
+        CONFIG.HAS_TREADY      {1} \
+        CONFIG.HAS_TLAST       {1} \
+    ] [get_ips axi4stream_vip_1]
+
+    generate_target all [get_ips axi4stream_vip_0]
+    generate_target all [get_ips axi4stream_vip_1]
+
+    # Add VIP simulation files to sim_1 so xsim compiles the packages
+    # before the testbench (compile order matters -- packages must precede
+    # any file that imports them).
+    foreach vip_name {axi4stream_vip_0 axi4stream_vip_1} {
+        set vip_sim_dir "${proj_dir}/${proj_name}.gen/sources_1/ip/${vip_name}/sim"
+        foreach sv_file [glob -nocomplain "${vip_sim_dir}/*.sv"] {
+            add_files -fileset sim_1 -norecurse $sv_file
+            puts "    Added VIP sim file: [file tail $sv_file]"
+        }
+    }
+    update_compile_order -fileset sim_1
+
+    # Add testbench and set as simulation top
+    add_files -fileset sim_1 -norecurse $tb_vip
+    set_property file_type {SystemVerilog} [get_files $tb_vip]
+    update_compile_order -fileset sim_1
+    set_property top     tb_fm_demod_axis_vip [get_filesets sim_1]
+    set_property top_lib xil_defaultlib       [get_filesets sim_1]
+    set_property -name {xsim.simulate.runtime} -value {all} \
+                 -objects [get_filesets sim_1]
+
+    puts "=== VIP testbench added: tb_fm_demod_axis_vip.sv ==="
+    puts "    Run simulation from Vivado GUI or via run_batch_sim.sh"
+} else {
+    puts "INFO: tb_fm_demod_axis_vip.sv not found -- skipping VIP testbench setup"
+    puts "INFO: Copy tb_fm_demod_axis_vip.sv to ${script_dir} and re-run to add it"
+}
 
 
 # ── Package FM Demod Block Design As A Vivado IP ───────────────────────────
