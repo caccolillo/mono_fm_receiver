@@ -537,3 +537,59 @@ move_dashboard_gadget -name {drc_1} -row 2 -col 0
 move_dashboard_gadget -name {timing_1} -row 0 -col 1
 move_dashboard_gadget -name {utilization_2} -row 1 -col 1
 move_dashboard_gadget -name {methodology_1} -row 2 -col 1
+
+#*****************************************************************************************
+# Build flow: launch synthesis, implementation, and bitstream generation, then export
+# the hardware platform (.xsa) for downstream Vitis / bare-metal or Linux BSP use.
+#*****************************************************************************************
+
+# Number of parallel jobs for the build. Adjust to match available cores/licenses.
+set num_jobs 4
+
+# ----------------------------------------------------------------------------
+# Synthesis
+# ----------------------------------------------------------------------------
+puts "=== Launching synthesis run: synth_1 ==="
+launch_runs synth_1 -jobs $num_jobs
+wait_on_run synth_1
+
+if { [get_property PROGRESS [get_runs synth_1]] != "100%" } {
+  error "ERROR: synth_1 failed or did not complete. Check the synthesis log before continuing."
+}
+puts "=== Synthesis (synth_1) complete ==="
+
+# ----------------------------------------------------------------------------
+# Implementation through bitstream generation
+# ----------------------------------------------------------------------------
+puts "=== Launching implementation run: impl_1 (through write_bitstream) ==="
+launch_runs impl_1 -to_step write_bitstream -jobs $num_jobs
+wait_on_run impl_1
+
+if { [get_property PROGRESS [get_runs impl_1]] != "100%" } {
+  error "ERROR: impl_1 failed or did not complete. Check the implementation log before continuing."
+}
+puts "=== Implementation + bitstream (impl_1) complete ==="
+
+# Open the implemented design so write_hw_platform has full context (timing, memory map, etc.)
+open_run impl_1 -name impl_1
+
+# ----------------------------------------------------------------------------
+# Export hardware platform (.xsa), bitstream included, for Vitis / PetaLinux
+# ----------------------------------------------------------------------------
+set xsa_dir "$proj_dir/${_xil_proj_name_}.export"
+file mkdir $xsa_dir
+set xsa_path "$xsa_dir/${_xil_proj_name_}.xsa"
+
+puts "=== Exporting hardware platform to $xsa_path ==="
+# -fixed        : fixed (non-extensible) platform, matches a standalone bitstream target
+# -include_bit  : embed the generated bitstream in the .xsa
+# -force        : overwrite if the file already exists (safe to re-run the script)
+write_hw_platform -fixed -include_bit -force -file $xsa_path
+
+if { [file exists $xsa_path] } {
+  puts "INFO: XSA export succeeded: $xsa_path"
+} else {
+  error "ERROR: XSA export failed - $xsa_path was not created."
+}
+
+puts "=== Build flow complete: bitstream generated and hardware platform exported ==="
