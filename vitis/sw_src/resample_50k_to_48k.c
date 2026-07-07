@@ -106,6 +106,37 @@ typedef struct __attribute__((packed)) {
     uint32_t data_size;
 } wav_header_t;
 
+/* FRESULT -> human-readable string. Duplicated from main.c rather than
+ * shared via a header, since both files are small and self-contained;
+ * see main.c's copy for the caveat about ff.h version-dependent enum
+ * ordering. */
+static const char *fresult_str(FRESULT fr)
+{
+    switch (fr) {
+        case FR_OK:                  return "FR_OK";
+        case FR_DISK_ERR:            return "FR_DISK_ERR (low-level I/O error)";
+        case FR_INT_ERR:             return "FR_INT_ERR (internal FATFS assertion failed)";
+        case FR_NOT_READY:           return "FR_NOT_READY (SD card/disk not ready)";
+        case FR_NO_FILE:             return "FR_NO_FILE (file not found)";
+        case FR_NO_PATH:             return "FR_NO_PATH (path not found)";
+        case FR_INVALID_NAME:        return "FR_INVALID_NAME (bad path/filename format)";
+        case FR_DENIED:              return "FR_DENIED (access denied / directory full)";
+        case FR_EXIST:               return "FR_EXIST (file already exists)";
+        case FR_INVALID_OBJECT:      return "FR_INVALID_OBJECT (invalid/stale file object)";
+        case FR_WRITE_PROTECTED:     return "FR_WRITE_PROTECTED";
+        case FR_INVALID_DRIVE:       return "FR_INVALID_DRIVE";
+        case FR_NOT_ENABLED:         return "FR_NOT_ENABLED (volume not mounted)";
+        case FR_NO_FILESYSTEM:       return "FR_NO_FILESYSTEM (no valid FAT volume found)";
+        case FR_MKFS_ABORTED:        return "FR_MKFS_ABORTED";
+        case FR_TIMEOUT:             return "FR_TIMEOUT";
+        case FR_LOCKED:              return "FR_LOCKED";
+        case FR_NOT_ENOUGH_CORE:     return "FR_NOT_ENOUGH_CORE (out of memory)";
+        case FR_TOO_MANY_OPEN_FILES: return "FR_TOO_MANY_OPEN_FILES";
+        case FR_INVALID_PARAMETER:   return "FR_INVALID_PARAMETER";
+        default:                     return "FR_<unrecognized code>";
+    }
+}
+
 static int wav_write_header(FIL *f, uint32_t sample_rate,
                              uint16_t num_channels, uint16_t bits_per_sample,
                              uint32_t data_bytes)
@@ -148,13 +179,18 @@ int resample_wav_50k_to_48k(const char *in_path, const char *out_path)
 
     fres = f_open(&fin, in_path, FA_READ);
     if (fres != FR_OK) {
-        xil_printf("resample: failed to open %s: %d\r\n", in_path, fres);
+        xil_printf("resample: failed to open %s: %s (%d)\r\n",
+                    in_path, fresult_str(fres), fres);
         return -1;
     }
+    xil_printf("resample: opened %s (%lu bytes)\r\n", in_path,
+                (unsigned long)f_size(&fin));
 
     if (f_read(&fin, &in_hdr, sizeof(in_hdr), &br) != FR_OK ||
         br != sizeof(in_hdr)) {
-        xil_printf("resample: failed to read input WAV header\r\n");
+        xil_printf("resample: failed to read %s's WAV header "
+                    "(got %u of %lu bytes)\r\n", in_path, br,
+                    (unsigned long)sizeof(in_hdr));
         goto cleanup_fin;
     }
     if (in_hdr.sample_rate != 50000 || in_hdr.bits_per_sample != 16 ||
@@ -176,8 +212,9 @@ int resample_wav_50k_to_48k(const char *in_path, const char *out_path)
 
     fres = f_read(&fin, in_buf, in_hdr.data_size, &br);
     if (fres != FR_OK || br != in_hdr.data_size) {
-        xil_printf("resample: failed to read input samples: %d "
-                    "(got %u of %lu bytes)\r\n", fres, br,
+        xil_printf("resample: failed to read %s's samples: %s (%d) "
+                    "(got %u of %lu bytes)\r\n", in_path,
+                    fresult_str(fres), fres, br,
                     (unsigned long)in_hdr.data_size);
         goto cleanup_in_buf;
     }
@@ -198,19 +235,21 @@ int resample_wav_50k_to_48k(const char *in_path, const char *out_path)
 
     fres = f_open(&fout, out_path, FA_WRITE | FA_CREATE_ALWAYS);
     if (fres != FR_OK) {
-        xil_printf("resample: failed to open %s: %d\r\n", out_path, fres);
+        xil_printf("resample: failed to open %s: %s (%d)\r\n",
+                    out_path, fresult_str(fres), fres);
         goto cleanup_both;
     }
 
     if (wav_write_header(&fout, 48000, 1, 16,
                           (uint32_t)n_out * sizeof(int16_t)) != 0) {
-        xil_printf("resample: failed to write output header\r\n");
+        xil_printf("resample: failed to write %s's WAV header\r\n", out_path);
         goto cleanup_fout;
     }
 
     fres = f_write(&fout, out_buf, (UINT)n_out * sizeof(int16_t), &bw);
     if (fres != FR_OK || bw != n_out * sizeof(int16_t)) {
-        xil_printf("resample: failed to write output samples: %d\r\n", fres);
+        xil_printf("resample: failed to write %s's samples: %s (%d)\r\n",
+                    out_path, fresult_str(fres), fres);
         goto cleanup_fout;
     }
 
