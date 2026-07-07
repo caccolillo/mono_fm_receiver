@@ -10,7 +10,7 @@
 
 set proj_dir   [lindex $argv 0]
 set script_dir [lindex $argv 1]
-set part       xc7z020clg400-1
+set part       xc7z010clg400-1
 
 puts "=== Creating freq_corr project ==="
 puts "    Project dir : ${proj_dir}"

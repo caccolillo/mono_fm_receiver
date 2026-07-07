@@ -30,7 +30,7 @@ if {[llength $argv] >= 2} {
 }
 
 set proj_name "nco_sim"
-set part      "xc7z020clg400-1"   ;# Zybo Z7-20
+set part      "xc7z010clg400-1"   ;# Zybo Z7-10
                                    ;# Arty A7-100T : xc7a100tcsg324-1
                                    ;# Ultra96-V2   : xczu3eg-sbva484-1-i
 
@@ -71,7 +71,7 @@ set_property CONFIG.Spurious_Free_Dynamic_Range {96}        [get_ips dds_compile
 set_property CONFIG.Amplitude_Mode              {Full_Range} [get_ips dds_compiler_0]
 set_property CONFIG.Noise_Shaping               {None}       [get_ips dds_compiler_0]
 set_property CONFIG.Memory_Type                 {Auto}       [get_ips dds_compiler_0]
-set_property CONFIG.DSP48_Use                   {Maximal}    [get_ips dds_compiler_0]
+set_property CONFIG.DSP48_Use                   {Minimal}    [get_ips dds_compiler_0]
 
 # Step 4: optional ports
 # No S_AXIS_CONFIG (fixed frequency — no dynamic retuning)

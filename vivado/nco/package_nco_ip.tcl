@@ -10,7 +10,7 @@
 #
 # Output: ./ip_repo/nco_v1_0/
 #
-# Marco Aiello, 2024
+
 
 set script_dir [file dirname [file normalize [info script]]]
 set ip_repo    "${script_dir}/ip_repo/nco_v1_0"

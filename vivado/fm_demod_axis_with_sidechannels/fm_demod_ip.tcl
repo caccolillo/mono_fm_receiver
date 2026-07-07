@@ -14,10 +14,10 @@
 # Usage: vivado -mode batch -source fm_demod_ip.tcl
 #
 
-# Project identifiers and target part (Zybo Z7-20)
+# Project identifiers and target part (Zybo Z7-10)
 set proj_name  fm_demod_axissidechannels_proj
 set proj_dir   [pwd]/fm_demod_proj
-set part       xc7z020clg400-1
+set part       xc7z010clg400-1
 # script_dir: directory containing all source files (passed via -tclargs)
 if { [llength $argv] >= 1 } {
     set script_dir [lindex $argv 0]

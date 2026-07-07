@@ -6,7 +6,7 @@ add_files audio_ppdma.cpp
 add_files -tb audio_ppdma_tb.cpp
 
 open_solution -reset "solution1"
-set_part {xc7z020clg400-1}
+set_part {xc7z010clg400-1}
 create_clock -period 10 -name default
 
 puts "--- C Simulation ---"

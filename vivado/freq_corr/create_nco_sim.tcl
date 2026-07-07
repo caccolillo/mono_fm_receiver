@@ -15,7 +15,7 @@
 #   source create_nco_sim.tcl
 #   (set proj_dir and script_dir at the top first)
 #
-# Marco Aiello, 2024
+
 
 # ── Arguments ─────────────────────────────────────────────────────────────
 # When called with -tclargs these are populated automatically.
@@ -30,7 +30,7 @@ if {[llength $argv] >= 2} {
 }
 
 set proj_name "nco_sim"
-set part      "xc7z020clg400-1"   ;# Zybo Z7-20
+set part      "xc7z010clg400-1"   ;# Zybo Z7-10
                                    ;# Arty A7-100T : xc7a100tcsg324-1
                                    ;# Ultra96-V2   : xczu3eg-sbva484-1-i
 
