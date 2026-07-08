@@ -1,0 +1,56 @@
+/*
+ * system-user.dtsi - reserved-memory overlay for sdr_fm_receiver_linux
+ *
+ * Reserves the same 5 x 1MB DDR blocks the ppdma cores' xlconstant
+ * addresses point at (see bd.tcl / audio_ppdma_0 / iq_ppdma_0), so the
+ * kernel's own memory allocator never hands this physical RAM out to
+ * anything else while fmdemod-linux is poking it directly via
+ * /dev/mem. This is the direct Linux-side continuation of the address
+ * plan worked out earlier for this project (0x3E000000-0x3E4FFFFF,
+ * just below the 1GB ceiling, clear of where u-boot/kernel/rootfs
+ * conventionally load).
+ *
+ * "no-map" is the key property: it tells the kernel to exclude this
+ * range from the buddy allocator entirely, rather than just marking it
+ * reserved-but-still-mappable. Without it, nothing stops another
+ * kernel subsystem or process from being handed a page inside this
+ * range.
+ *
+ * PetaLinux merges any system-user.dtsi found in
+ * project-spec/meta-user/recipes-bsp/device-tree/files/ into the final
+ * device tree automatically -- no manual dtc invocation needed.
+ */
+
+/include/ "system-conf.dtsi"
+/ {
+    reserved-memory {
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+
+        iq_ping_buf: iq-ping-buf@3e000000 {
+            no-map;
+            reg = <0x3e000000 0x00100000>; /* 1 MB */
+        };
+
+        iq_pong_buf: iq-pong-buf@3e100000 {
+            no-map;
+            reg = <0x3e100000 0x00100000>; /* 1 MB */
+        };
+
+        audio_ping_buf: audio-ping-buf@3e200000 {
+            no-map;
+            reg = <0x3e200000 0x00100000>; /* 1 MB */
+        };
+
+        audio_pong_buf: audio-pong-buf@3e300000 {
+            no-map;
+            reg = <0x3e300000 0x00100000>; /* 1 MB */
+        };
+
+        audio_dest_buf: audio-dest-buf@3e400000 {
+            no-map;
+            reg = <0x3e400000 0x00100000>; /* 1 MB */
+        };
+    };
+};
