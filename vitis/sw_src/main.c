@@ -330,14 +330,41 @@ static int drain_audio_block(FIL *fout, u32 *total_audio_bytes)
 {
     FRESULT fres;
     UINT bytes_written;
+    u32 i;
 
-    Xil_DCacheInvalidateRange((INTPTR)AUDIO_DEST_ADDR,
-                               AUDIO_SAMPLES_PER_BUFFER * sizeof(u32));
+    /* Cache coherency: audio_ppdma_0 writes AUDIO_DEST_ADDR via the
+     * HP0 port, which bypasses the ARM L1/L2 data cache. Without an
+     * explicit invalidate the CPU may read stale cached content from a
+     * previous read of the same address rather than the fresh data the
+     * PL just wrote to DDR.
+     *
+     * The invalidate MUST come before ANY CPU read of this region --
+     * including the memcpy below. Calling it after the reads (or
+     * omitting it) leaves the cache holding stale data and the PCM
+     * output will be silence or garbage from power-on DDR content.
+     *
+     * Size: AUDIO_SAMPLES_PER_BUFFER * 4 bytes, aligned to cache line
+     * (audio_dest_raw is 64-byte aligned, so this is always correct). */
+    static u32 audio_dest_raw[AUDIO_SAMPLES_PER_BUFFER]
+        __attribute__((aligned(64)));
 
-    for (u32 i = 0; i < AUDIO_SAMPLES_PER_BUFFER; i++) {
-        int32_t raw = (int32_t)Xil_In32(AUDIO_DEST_ADDR + i * sizeof(u32));
+    Xil_DCacheInvalidateRange((INTPTR)audio_dest_raw,
+                               sizeof(audio_dest_raw));
 
-        /* sfix32_En13 -> real value, ASSUMED +-1.0 full scale. */
+    /* Copy from DDR into a local aligned buffer AFTER invalidate, so
+     * the CPU fetches fresh lines from DDR into cache, not stale ones.
+     * Using memcpy (not Xil_In32) means the CPU uses its cached data
+     * path after the invalidate, which is what we want. */
+    memcpy(audio_dest_raw,
+           (const void *)(uintptr_t)AUDIO_DEST_ADDR,
+           sizeof(audio_dest_raw));
+
+    for (i = 0; i < AUDIO_SAMPLES_PER_BUFFER; i++) {
+        int32_t raw = (int32_t)audio_dest_raw[i];
+
+        /* sfix32_En13 -> real value, ASSUMED +-1.0 full scale.
+         * Divide by 2^13 = 8192 to get real value in [-1, +1),
+         * then scale to int16 range. */
         float val    = (float)raw / 8192.0f;
         float scaled = val * 32767.0f;
         if (scaled > 32767.0f)  scaled = 32767.0f;

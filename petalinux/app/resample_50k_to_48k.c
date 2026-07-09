@@ -4,7 +4,7 @@
  * Identical resampling MATH to the bare-metal version -- same
  * resample_coeffs.h, same resample_core() algorithm, completely
  * unchanged. Only the FILE I/O primitives changed: FATFS (FIL/f_open/
- * f_read/f_write/FRESULT) -> plain POSIX (FILE*/fopen/fread/fwrite).
+ * f_read/f_write/FRESULT) -> plain POSIX (FILE *, fopen/fread/fwrite).
  * No FATFS/xilffs dependency remains in this file at all.
  */
 
