@@ -135,16 +135,18 @@ else
 fi
 
 # ---- 4. rootfs packages: libgpiod (+ CLI tools for debugging) --------
-# Preset non-interactively by appending CONFIG_ lines to rootfs_config,
-# then re-running config in silent mode to apply them. This is the
-# standard non-interactive equivalent of `petalinux-config -c rootfs`.
+# Preset non-interactively by appending CONFIG_ lines to rootfs_config.
+# NOTE: do NOT add openssh -- petalinux-image-minimal already includes
+# packagegroup-core-ssh-dropbear which pulls in dropbear. openssh and
+# dropbear both provide sshd and CONFLICT -- openssh cannot be added.
+# Keep dropbear (the PetaLinux default) and use dropbear-scp for file
+# transfer instead of openssh-sftp-server.
 ROOTFS_CONFIG="project-spec/configs/rootfs_config"
-echo "--- Enabling libgpiod (+ tools), openssh, dhcp client in rootfs ---"
+echo "--- Enabling libgpiod (+ tools), dropbear-scp, dhcp client in rootfs ---"
 for pkg in \
     CONFIG_libgpiod \
     CONFIG_gpiod-tools \
-    CONFIG_openssh \
-    CONFIG_openssh-sftp-server \
+    CONFIG_dropbear-scp \
     CONFIG_udhcpc \
     CONFIG_i2c-tools
 do
@@ -165,46 +167,56 @@ APP_FILES_DIR="${APP_RECIPE_DIR}/files"
 
 echo "--- Installing fmdemod-linux source into the app recipe ---"
 mkdir -p "${APP_FILES_DIR}"
-# petalinux-create's C template names the generated source after the
-# app: fmdemod-linux.c. Overwrite it with our real implementation.
 cp "${APP_SRC_DIR}/fmdemod-linux.c"        "${APP_FILES_DIR}/${APP_NAME}.c"
-# Copy companion files — resample_50k_to_48k.c defines resample_wav_50k_to_48k()
-# which fmdemod-linux.c calls; resample_coeffs.h contains the 2208-tap FIR table.
-# Without these the linker fails with undefined reference to resample_wav_50k_to_48k.
 cp "${APP_SRC_DIR}/resample_50k_to_48k.c" "${APP_FILES_DIR}/resample_50k_to_48k.c"
 cp "${APP_SRC_DIR}/resample_coeffs.h"     "${APP_FILES_DIR}/resample_coeffs.h"
 
-# The scaffolded Makefile already builds ${APP_NAME}.c by default --
-# but our app links against libgpiod, so the Makefile and recipe .bb
-# need that dependency added. Patch both if not already present.
+# Write a known-correct Makefile rather than trying to patch the
+# scaffolded one, whose exact structure varies between PetaLinux versions
+# and whose variable names can't be reliably sed-patched.
+# This Makefile:
+#   - compiles both .c files explicitly
+#   - links against -lgpiod (libgpiod character device API)
+#   - links against -lm (lroundf in resample_50k_to_48k.c)
 APP_MAKEFILE="${APP_FILES_DIR}/Makefile"
-if [ -f "${APP_MAKEFILE}" ]; then
-    # Add -lgpiod (GPIO character device API) and -lm (lroundf in resample)
-    if ! grep -q "lgpiod" "${APP_MAKEFILE}"; then
-        echo "--- Adding -lgpiod -lm to app Makefile ---"
-        sed -i 's/^LDFLAGS.*/& -lgpiod -lm/' "${APP_MAKEFILE}" || \
-            echo "LDFLAGS += -lgpiod -lm" >> "${APP_MAKEFILE}"
-    fi
-    # Add resample_50k_to_48k.c to the list of compiled sources.
-    # The scaffolded Makefile compiles only the single ${APP_NAME}.c file;
-    # the companion source must be added explicitly or the linker will fail
-    # with undefined reference to resample_wav_50k_to_48k.
-    if ! grep -q "resample_50k_to_48k" "${APP_MAKEFILE}"; then
-        echo "--- Adding resample_50k_to_48k.c to app Makefile ---"
-        sed -i "s/${APP_NAME}.o/${APP_NAME}.o resample_50k_to_48k.o/" "${APP_MAKEFILE}" || \
-            echo "OBJS += resample_50k_to_48k.o" >> "${APP_MAKEFILE}"
-    fi
-fi
+echo "--- Writing app Makefile (replacing scaffolded version) ---"
+cat > "${APP_MAKEFILE}" << 'MAKEFILE_EOF'
+APP = fmdemod-linux
+
+OBJS = fmdemod-linux.o resample_50k_to_48k.o
+
+# Do NOT override CFLAGS or LDFLAGS — Yocto injects the correct sysroot
+# paths, security flags, and library search paths via the environment.
+# We only append what we specifically need on top of what Yocto provides.
+CFLAGS  += -Wall -O2 -I.
+LDFLAGS += -lgpiod -lm
+
+.PHONY: all clean
+
+all: $(APP)
+
+$(APP): $(OBJS)
+	$(CC) $(OBJS) $(LDFLAGS) -o $@
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+resample_50k_to_48k.o: resample_50k_to_48k.c resample_coeffs.h
+fmdemod-linux.o: fmdemod-linux.c resample_coeffs.h
+
+clean:
+	rm -f $(APP) $(OBJS)
+MAKEFILE_EOF
 
 APP_BB="${APP_RECIPE_DIR}/${APP_NAME}.bb"
 if [ -f "${APP_BB}" ]; then
     if ! grep -q "libgpiod" "${APP_BB}"; then
-        echo "--- Adding libgpiod DEPENDS to app recipe ---"
+        echo "--- Adding libgpiod DEPENDS/RDEPENDS to app recipe ---"
+        # DEPENDS: ensures libgpiod headers+library are staged before compile
         echo 'DEPENDS += "libgpiod"' >> "${APP_BB}"
+        # RDEPENDS: ensures libgpiod.so is installed on the rootfs at runtime
+        echo 'RDEPENDS:${PN} += "libgpiod"' >> "${APP_BB}"
     fi
-    # The scaffolded .bb recipe's SRC_URI only fetches the single .c file
-    # that petalinux-create generated. Add the companion files explicitly
-    # so bitbake copies them into the build directory alongside the main source.
     if ! grep -q "resample_50k_to_48k" "${APP_BB}"; then
         echo "--- Adding companion sources to app recipe SRC_URI ---"
         echo 'SRC_URI += "file://resample_50k_to_48k.c file://resample_coeffs.h"' >> "${APP_BB}"
