@@ -1,7 +1,15 @@
 #!/bin/bash
 set -e
-cd "$(dirname "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
 
-vivado -mode batch -source fm_demod_ip.tcl \
-       -log de_emph_vivado.log -journal de_emph_vivado.jou
+echo "=== FM Demod IP Build ==="
+echo "Directory: ${SCRIPT_DIR}"
 
+stdbuf -oL -eL vivado -mode batch \
+    -source fm_demod_ip.tcl \
+    -tclargs "${SCRIPT_DIR}" \
+    -log fm_demod_vivado.log \
+    -journal fm_demod_vivado.jou
+
+echo "=== Done ==="

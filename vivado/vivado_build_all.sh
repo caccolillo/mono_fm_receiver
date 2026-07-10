@@ -4,7 +4,7 @@
 set -e
 
 # Define the subfolders in the required sequence
-SUBFOLDERS=("aa_lpf" "audio_lpf" "de_emphasis" "fir_decimation" "fm_disc" "freq_corr" "nco" "fm_demod" "fm_demod_axis_with_sidechannels" "end_system")
+SUBFOLDERS=("aa_lpf" "audio_lpf" "de_emphasis" "fir_decimation" "fm_disc" "freq_corr" "nco" "fm_demod" "fm_demod_axis_with_sidechannels" "audio_ppdma" "iq_ppdma" "end_system")
 
 # Store the starting directory
 ROOT_DIR=$(pwd)
