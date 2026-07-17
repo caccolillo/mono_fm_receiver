@@ -1,71 +1,22 @@
 /*
  * main.c - Bare-metal FM demodulator bring-up: SD card WAV I/O
  *
- * ARCHITECTURE REWRITE NOTICE: this is a full rewrite, not a patch. The
- * AXI DMA IP the previous version of this file drove (XAxiDma_*, MM2S/
- * S2MM, per-frame one-shot transfers arm'd and polled from software) no
- * longer exists anywhere in this design -- it was replaced by two
- * custom, free-running HLS ping-pong DMA cores (audio_ppdma_0,
- * iq_ppdma_0) with ap_start tied permanently high in the block design.
- * There is no descriptor to arm and no way to pace transfers from
- * software: the hardware runs continuously regardless of what this
- * program does or doesn't do.
+ * DEBUG BUILD: this version adds verbose diagnostic prints at every
+ * critical point to isolate why audio output is wrong or silent.
+ * Every print is gated on a counter or a one-shot flag so it does
+ * NOT execute on every loop iteration (which would destroy timing).
  *
- * NEW architecture, concretely:
+ * ARCHITECTURE: two custom HLS ping-pong DMA cores (audio_ppdma_0,
+ * iq_ppdma_0) with ap_start tied permanently HIGH in the block design.
+ * Hardware runs continuously. Software polls GPIO active_buf bits and
+ * refills/drains the idle buffer.
  *
- *   iq_ppdma_0 continuously reads packed 32-bit I/Q words from one of
- *   two fixed DDR buffers, IQ_PING_ADDR / IQ_PONG_ADDR, IQ_BUF_SIZE_WORDS
- *   words each (10 ms @ 250 kHz), and reports which one it's currently
- *   reading via axi_gpio_0 channel 1 (GPIO_DATA). Software's job: watch
- *   that bit -- every time it flips, the buffer the core just LEFT is
- *   safe to refill with the next IQ_BUF_SIZE_WORDS samples from the
- *   input WAV.
- *
- *   audio_ppdma_0 writes demodulated audio into its own internal
- *   ping/pong pair, then mirrors each completed AUDIO_SAMPLES_PER_BUFFER
- *   -word block (1 ms, matching the compile-time constant in
- *   audio_ppdma.cpp) into one fixed address, AUDIO_DEST_ADDR, and
- *   reports the event via axi_gpio_0 channel 2 (GPIO2_DATA). Software's
- *   job: watch that bit -- every time it flips, a fresh block is ready
- *   at AUDIO_DEST_ADDR to be read, converted, and written to the output
- *   WAV.
- *
- * FLAGGED ASSUMPTIONS (verify before trusting the output):
- *   1. I/Q packing order: assumes the input WAV stores interleaved
- *      16-bit I,Q pairs (I first) and that {I[31:16], Q[15:0]} is the
- *      correct packed-word convention (matches iq_ppdma.h as written).
- *      If audio comes out garbled, this is the first thing to check --
- *      swap the pack order in refill_iq_buffer() if so.
- *   2. sfix32_En13 -> PCM16 scale factor: assumes +-1.0 real-value full
- *      scale (raw / 8192.0 -> [-1,1] -> * 32767). If audio is clipped
- *      or far too quiet, check the actual signal range against
- *      verify_fm_demod_rtl.m's known-good reference and adjust.
- *   3. AXI_GPIO_0_BASEADDR is a literal, not pulled from an actual
- *      generated xparameters.h -- confirm it matches
- *      XPAR_AXI_GPIO_0_BASEADDR (or equivalent) for your BSP.
- *
- * REAL-TIME CONSTRAINT (new -- did not exist under the old per-frame
- * DMA model): because the hardware never stalls for software, the I/Q
- * refill below must complete within roughly
- * IQ_BUF_SIZE_WORDS / 250000 = 10 ms, or iq_ppdma_0 will wrap back onto
- * a buffer that hasn't been refilled yet and re-read stale data. SD
- * card f_read() latency on real hardware is what to measure and budget
- * against here -- this was flagged as an open risk when
- * IQ_BUF_SIZE_WORDS was chosen and has NOT been verified against real
- * SD card timing on this target.
- *
- * STARTUP NOTE: ap_start being tied high means iq_ppdma_0 starts
- * reading DDR the instant the PL configures -- almost certainly before
- * this program's main() ever runs (bitstream loads via FSBL/boot well
- * before this ELF executes). The first several audio samples will
- * reflect whatever was in DDR at power-on, not real I/Q data, until the
- * first refill below catches up. This is an expected startup
- * transient, not a bug to chase.
- *
- * resample_50k_to_48k.c / resample_coeffs.h are UNCHANGED by any of
- * this -- that module is a pure post-processing file-to-file batch
- * resampler with no DMA dependency at all, and is called exactly as
- * before at the end of main().
+ * CACHE COHERENCY FIX (the confirmed hardware bug):
+ *   audio_ppdma_0 writes AUDIO_DEST_ADDR via HP0 (bypasses ARM cache).
+ *   Xil_DCacheInvalidateRange + memcpy (not Xil_In32) is the correct
+ *   read pattern. Xil_In32 bypasses cache so the invalidate has no
+ *   effect on it -- using memcpy after invalidate forces a cache-line
+ *   refill from DDR.
  */
 
 #include "xparameters.h"
@@ -79,412 +30,496 @@
 #include <stdint.h>
 
 /* ------------------------------------------------------------------ */
-/* Fixed DDR addresses -- MUST match the xlconstant values wired to
- * ping_base/pong_base/dest_base/buf_size_words in bd.tcl. These are
- * raw DDR pointers, not AXI-mapped peripherals, so there is no
- * xparameters.h macro for them -- they are hardware constants baked
- * directly into the block design.
- * ------------------------------------------------------------------ */
-#define IQ_PING_ADDR              0x3E000000u   /* xlconstant_1 */
-#define IQ_PONG_ADDR              0x3E100000u   /* xlconstant_2 */
-#define AUDIO_DEST_ADDR           0x3E400000u   /* xlconstant_5 */
-#define IQ_BUF_SIZE_WORDS         2500u         /* 10 ms @ 250 kHz -- xlconstant_6 */
-#define AUDIO_SAMPLES_PER_BUFFER  50u           /* 1 ms @ 50 kHz -- audio_ppdma.cpp compile-time constant */
-
-/* How many extra 1 ms audio blocks to keep draining after the input
- * WAV is exhausted, to flush whatever real samples are still in
- * flight (fm_demod's own pipeline latency, plus whatever was left
- * un-consumed in the last-filled I/Q buffer). Conservative, round
- * number -- tune once real pipeline latency is characterized on
- * target; err high rather than clip the ending. */
+/* Hardware addresses -- MUST match bd.tcl xlconstant values           */
+/* ------------------------------------------------------------------ */
+#define IQ_PING_ADDR              0x3E000000u
+#define IQ_PONG_ADDR              0x3E100000u
+#define AUDIO_DEST_ADDR           0x3E400000u
+#define IQ_BUF_SIZE_WORDS         2500u
+#define AUDIO_SAMPLES_PER_BUFFER  50u
 #define AUDIO_EOF_GRACE_BLOCKS    20u
-
-/* AXI GPIO (dual-channel, both inputs), base address per bd.tcl's
- * assign_bd_address on axi_gpio_0/S_AXI/Reg. See FLAGGED ASSUMPTIONS
- * (3) above. */
 #define AXI_GPIO_0_BASEADDR       0x40000000u
-#define GPIO_DATA_OFFSET          0x00u   /* channel 1 <- iq_ppdma_0/active_buf */
-#define GPIO2_DATA_OFFSET         0x08u   /* channel 2 <- audio_ppdma_0/active_buf */
+#define GPIO_DATA_OFFSET          0x00u
+#define GPIO2_DATA_OFFSET         0x08u
 
-/* 8.3-safe (3-letter) filenames -- xilffs BSP builds are frequently
- * configured WITHOUT long-filename support (_USE_LFN=0), in which case
- * anything past an 8-char base name / 3-char extension either fails
- * outright or gets silently truncated/mangled. rds.wav already fits;
- * the two names below were previously audio_50k.wav / audio_out.wav
- * (9-char bases), which do NOT fit -- renamed to be safe regardless of
- * how LFN is configured on this BSP. */
-#define INPUT_WAV_PATH            "0:/rds.wav"
-#define INTERMEDIATE_WAV_PATH     "0:/A50.WAV"
-#define OUTPUT_WAV_PATH           "0:/A48.WAV"
+/* ------------------------------------------------------------------ */
+/* File paths                                                           */
+/* ------------------------------------------------------------------ */
+#define INPUT_WAV_PATH        "0:/rds.wav"
+#define INTERMEDIATE_WAV_PATH "0:/A50.WAV"
+#define OUTPUT_WAV_PATH       "0:/A48.WAV"
+
+/* ------------------------------------------------------------------ */
+/* Debug verbosity controls                                             */
+/* Adjust these without touching the logic below.                      */
+/* ------------------------------------------------------------------ */
+/* Print raw DDR content for the first N drain calls */
+#define DBG_DRAIN_RAW_FIRST_N      5u
+/* Print IQ packing sample for the first N refill calls */
+#define DBG_IQ_PACK_FIRST_N        3u
+/* Print audio stats every N blocks */
+#define DBG_AUDIO_STATS_EVERY      50u
+/* Print IQ refill progress every N refills */
+#define DBG_IQ_PROGRESS_EVERY      10u
+/* Print audio progress every N blocks */
+#define DBG_AUDIO_PROGRESS_EVERY   50u
 
 int resample_wav_50k_to_48k(const char *in_path, const char *out_path);
 
 static FATFS fatfs;
 
 /* ------------------------------------------------------------------ */
-/* FRESULT -> human-readable string. Mirrors the standard FatFs FRESULT
- * enum order (Xilinx's xilffs is a fairly direct port of ChaN's FatFs),
- * but ff.h has had minor reorderings across versions historically --
- * if any of these look wrong against your actual ff.h, that enum
- * ordering is the first thing to check.
- * ------------------------------------------------------------------ */
+/* FRESULT string                                                       */
+/* ------------------------------------------------------------------ */
 static const char *fresult_str(FRESULT fr)
 {
     switch (fr) {
         case FR_OK:                  return "FR_OK";
-        case FR_DISK_ERR:            return "FR_DISK_ERR (low-level I/O error)";
-        case FR_INT_ERR:             return "FR_INT_ERR (internal FATFS assertion failed)";
-        case FR_NOT_READY:           return "FR_NOT_READY (SD card/disk not ready)";
-        case FR_NO_FILE:             return "FR_NO_FILE (file not found)";
-        case FR_NO_PATH:             return "FR_NO_PATH (path not found)";
-        case FR_INVALID_NAME:        return "FR_INVALID_NAME (bad path/filename format)";
-        case FR_DENIED:              return "FR_DENIED (access denied / directory full)";
-        case FR_EXIST:               return "FR_EXIST (file already exists)";
-        case FR_INVALID_OBJECT:      return "FR_INVALID_OBJECT (invalid/stale file object)";
+        case FR_DISK_ERR:            return "FR_DISK_ERR";
+        case FR_INT_ERR:             return "FR_INT_ERR";
+        case FR_NOT_READY:           return "FR_NOT_READY";
+        case FR_NO_FILE:             return "FR_NO_FILE";
+        case FR_NO_PATH:             return "FR_NO_PATH";
+        case FR_INVALID_NAME:        return "FR_INVALID_NAME";
+        case FR_DENIED:              return "FR_DENIED";
+        case FR_EXIST:               return "FR_EXIST";
+        case FR_INVALID_OBJECT:      return "FR_INVALID_OBJECT";
         case FR_WRITE_PROTECTED:     return "FR_WRITE_PROTECTED";
         case FR_INVALID_DRIVE:       return "FR_INVALID_DRIVE";
-        case FR_NOT_ENABLED:         return "FR_NOT_ENABLED (volume not mounted)";
-        case FR_NO_FILESYSTEM:       return "FR_NO_FILESYSTEM (no valid FAT volume found)";
+        case FR_NOT_ENABLED:         return "FR_NOT_ENABLED";
+        case FR_NO_FILESYSTEM:       return "FR_NO_FILESYSTEM";
         case FR_MKFS_ABORTED:        return "FR_MKFS_ABORTED";
         case FR_TIMEOUT:             return "FR_TIMEOUT";
         case FR_LOCKED:              return "FR_LOCKED";
-        case FR_NOT_ENOUGH_CORE:     return "FR_NOT_ENOUGH_CORE (out of memory)";
+        case FR_NOT_ENOUGH_CORE:     return "FR_NOT_ENOUGH_CORE";
         case FR_TOO_MANY_OPEN_FILES: return "FR_TOO_MANY_OPEN_FILES";
         case FR_INVALID_PARAMETER:   return "FR_INVALID_PARAMETER";
-        default:                     return "FR_<unrecognized code>";
+        default:                     return "FR_<unknown>";
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* Lists every entry in the SD card's root directory with size, so a
- * "file not found" further down has an immediate, concrete answer for
- * "well what IS actually on the card, and under what exact name/case".
- * Uses the plain fno.fname field (older/simpler FILINFO layout, no
- * separate lfname buffer) -- matches the common Xilinx xilffs FILINFO
- * struct, but this hasn't been verified against your exact ff.h; if it
- * doesn't compile, that struct layout is the first thing to check.
- * ------------------------------------------------------------------ */
+/* SD card directory listing                                            */
+/* ------------------------------------------------------------------ */
 static void list_sd_card_root(void)
 {
-    DIR dir;
-    FILINFO fno;
-    FRESULT fres;
-    int count = 0;
-
-    xil_printf("--- SD card root directory listing (0:/) ---\r\n");
-
+    DIR dir; FILINFO fno; FRESULT fres; int count = 0;
+    xil_printf("--- SD card root (0:/) ---\r\n");
     fres = f_opendir(&dir, "0:/");
     if (fres != FR_OK) {
-        xil_printf("f_opendir(0:/) failed: %s (%d)\r\n", fresult_str(fres), fres);
+        xil_printf("  f_opendir failed: %s (%d)\r\n", fresult_str(fres), fres);
         return;
     }
-
     for (;;) {
         fres = f_readdir(&dir, &fno);
-        if (fres != FR_OK) {
-            xil_printf("f_readdir failed: %s (%d)\r\n", fresult_str(fres), fres);
-            break;
-        }
-        if (fno.fname[0] == 0) {
-            break; /* end of directory */
-        }
-        if (fno.fattrib & AM_DIR) {
-            xil_printf("  <DIR>       %s\r\n", fno.fname);
-        } else {
+        if (fres != FR_OK || fno.fname[0] == 0) break;
+        if (fno.fattrib & AM_DIR)
+            xil_printf("  <DIR>  %s\r\n", fno.fname);
+        else
             xil_printf("  %10lu  %s\r\n", (unsigned long)fno.fsize, fno.fname);
-        }
         count++;
     }
-
     f_closedir(&dir);
-    xil_printf("--- end of listing (%d entries) ---\r\n", count);
+    xil_printf("--- %d entries ---\r\n", count);
 }
 
 /* ------------------------------------------------------------------ */
-/* Minimal canonical 44-byte PCM WAV header (unchanged from before)    */
+/* WAV header helpers                                                   */
 /* ------------------------------------------------------------------ */
 typedef struct __attribute__((packed)) {
-    char  riff_id[4];
-    u32   riff_size;
-    char  wave_id[4];
-    char  fmt_id[4];
-    u32   fmt_size;
-    u16   audio_format;
-    u16   num_channels;
-    u32   sample_rate;
-    u32   byte_rate;
-    u16   block_align;
-    u16   bits_per_sample;
-    char  data_id[4];
-    u32   data_size;
+    char  riff_id[4]; u32 riff_size; char wave_id[4];
+    char  fmt_id[4];  u32 fmt_size;  u16 audio_format;
+    u16   num_channels; u32 sample_rate; u32 byte_rate;
+    u16   block_align;  u16 bits_per_sample;
+    char  data_id[4]; u32 data_size;
 } wav_header_t;
 
-static int wav_write_placeholder_header(FIL *f, u32 sample_rate,
-                                         u16 num_channels, u16 bits_per_sample)
+static int wav_write_placeholder_header(FIL *f, u32 rate, u16 ch, u16 bps)
 {
-    wav_header_t hdr;
-    UINT written;
-
-    memcpy(hdr.riff_id, "RIFF", 4);
-    hdr.riff_size = 0; /* patched later */
-    memcpy(hdr.wave_id, "WAVE", 4);
-    memcpy(hdr.fmt_id, "fmt ", 4);
-    hdr.fmt_size = 16;
-    hdr.audio_format = 1;
-    hdr.num_channels = num_channels;
-    hdr.sample_rate = sample_rate;
-    hdr.bits_per_sample = bits_per_sample;
-    hdr.block_align = num_channels * (bits_per_sample / 8);
-    hdr.byte_rate = sample_rate * hdr.block_align;
-    memcpy(hdr.data_id, "data", 4);
-    hdr.data_size = 0; /* patched later */
-
-    return (f_write(f, &hdr, sizeof(hdr), &written) == FR_OK &&
-            written == sizeof(hdr)) ? 0 : -1;
+    wav_header_t h; UINT w;
+    memcpy(h.riff_id,"RIFF",4); h.riff_size=0;
+    memcpy(h.wave_id,"WAVE",4); memcpy(h.fmt_id,"fmt ",4);
+    h.fmt_size=16; h.audio_format=1; h.num_channels=ch;
+    h.sample_rate=rate; h.bits_per_sample=bps;
+    h.block_align=ch*(bps/8); h.byte_rate=rate*h.block_align;
+    memcpy(h.data_id,"data",4); h.data_size=0;
+    return (f_write(f,&h,sizeof(h),&w)==FR_OK && w==sizeof(h)) ? 0 : -1;
 }
 
 static int wav_patch_header(FIL *f, u32 data_bytes)
 {
-    UINT written;
+    UINT w;
     u32 riff_size = data_bytes + sizeof(wav_header_t) - 8;
-
-    if (f_lseek(f, 4) != FR_OK) return -1;
-    if (f_write(f, &riff_size, 4, &written) != FR_OK || written != 4) return -1;
-
-    if (f_lseek(f, 40) != FR_OK) return -1;
-    if (f_write(f, &data_bytes, 4, &written) != FR_OK || written != 4) return -1;
-
+    if (f_lseek(f,4)!=FR_OK) return -1;
+    if (f_write(f,&riff_size,4,&w)!=FR_OK||w!=4) return -1;
+    if (f_lseek(f,40)!=FR_OK) return -1;
+    if (f_write(f,&data_bytes,4,&w)!=FR_OK||w!=4) return -1;
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* GPIO helpers -- direct register access, no DMA involved at all.     */
+/* GPIO helpers                                                         */
 /* ------------------------------------------------------------------ */
 static inline u32 gpio_read_iq_active(void)
 {
     return Xil_In32(AXI_GPIO_0_BASEADDR + GPIO_DATA_OFFSET) & 0x1u;
 }
-
 static inline u32 gpio_read_audio_active(void)
 {
     return Xil_In32(AXI_GPIO_0_BASEADDR + GPIO2_DATA_OFFSET) & 0x1u;
 }
 
 /* ------------------------------------------------------------------ */
-/* Static scratch buffers -- deliberately NOT stack-allocated. 2 *
- * IQ_BUF_SIZE_WORDS int16 samples is 10000 bytes; on a typical
- * bare-metal Cortex-A9 stack (often just a few KB by default) that
- * would risk a silent stack overflow if put on the stack instead. */
+/* Static buffers (not on stack -- too large)                          */
 /* ------------------------------------------------------------------ */
 static int16_t iq_stage[2 * IQ_BUF_SIZE_WORDS] __attribute__((aligned(64)));
 static u32     iq_packed[IQ_BUF_SIZE_WORDS]    __attribute__((aligned(64)));
 static int16_t audio_pcm_block[AUDIO_SAMPLES_PER_BUFFER] __attribute__((aligned(64)));
+static u32     audio_dest_raw[AUDIO_SAMPLES_PER_BUFFER]  __attribute__((aligned(64)));
 
-/*
- * Refills one ping/pong I/Q buffer with the next IQ_BUF_SIZE_WORDS
- * sample pairs from the input WAV, packing each pair into the 32-bit
- * word format iq_ppdma_0 expects (see FLAGGED ASSUMPTION 1 above).
- * Zero-pads the tail if fewer real samples remain. Sets *eof_hit if
- * this call reached the end of the input file.
- */
+/* ------------------------------------------------------------------ */
+/* refill_iq_buffer                                                     */
+/* ------------------------------------------------------------------ */
+static u32 dbg_iq_call = 0;
+
 static void refill_iq_buffer(FIL *fin, u32 dest_addr, int *eof_hit)
 {
-    UINT bytes_read;
-    FRESULT fres;
-    u32 pairs_read;
+    UINT bytes_read; FRESULT fres; u32 pairs_read;
 
     fres = f_read(fin, iq_stage, sizeof(iq_stage), &bytes_read);
     if (fres != FR_OK) {
-        xil_printf("refill_iq_buffer: f_read(%s) failed: %s (%d) [dest_addr=0x%08lx]\r\n",
-                   INPUT_WAV_PATH, fresult_str(fres), fres, (unsigned long)dest_addr);
-        *eof_hit = 1;
-        return;
+        xil_printf("[IQ] f_read FAILED: %s (%d) dest=0x%08lX\r\n",
+                   fresult_str(fres), fres, (unsigned long)dest_addr);
+        *eof_hit = 1; return;
     }
 
     pairs_read = bytes_read / (2 * sizeof(int16_t));
     if (pairs_read < IQ_BUF_SIZE_WORDS) {
+        xil_printf("[IQ] EOF: got %lu/%lu pairs on refill #%lu\r\n",
+                   (unsigned long)pairs_read,
+                   (unsigned long)IQ_BUF_SIZE_WORDS,
+                   (unsigned long)dbg_iq_call);
         *eof_hit = 1;
     }
 
     for (u32 i = 0; i < IQ_BUF_SIZE_WORDS; i++) {
         if (i < pairs_read) {
-            int16_t I = iq_stage[2 * i];
-            int16_t Q = iq_stage[2 * i + 1];
+            int16_t I = iq_stage[2*i];
+            int16_t Q = iq_stage[2*i+1];
             iq_packed[i] = ((u32)(u16)I << 16) | (u32)(u16)Q;
         } else {
-            iq_packed[i] = 0; /* zero-pad the tail */
+            iq_packed[i] = 0;
         }
     }
 
-    memcpy((void *)(uintptr_t)dest_addr, iq_packed, sizeof(iq_packed));
+    /* DEBUG: print first sample of first few refills to verify packing */
+    if (dbg_iq_call < DBG_IQ_PACK_FIRST_N) {
+        int16_t I0 = iq_stage[0];
+        int16_t Q0 = iq_stage[1];
+        xil_printf("[IQ#%lu] dest=0x%08lX  I[0]=%d Q[0]=%d  packed[0]=0x%08lX\r\n",
+                   (unsigned long)dbg_iq_call,
+                   (unsigned long)dest_addr,
+                   (int)I0, (int)Q0,
+                   (unsigned long)iq_packed[0]);
+    }
+
+    memcpy((void*)(uintptr_t)dest_addr, iq_packed, sizeof(iq_packed));
+
+    /* Flush so iq_ppdma_0 sees fresh data via HP0 (not stale cache) */
     Xil_DCacheFlushRange((INTPTR)dest_addr, sizeof(iq_packed));
+
+    dbg_iq_call++;
 }
 
-/*
- * Reads one completed AUDIO_SAMPLES_PER_BUFFER-word block from
- * AUDIO_DEST_ADDR, converts each sfix32_En13 sample to 16-bit PCM (see
- * FLAGGED ASSUMPTION 2 above), and writes it to the output WAV.
- * Returns 0 on success.
- */
+/* ------------------------------------------------------------------ */
+/* drain_audio_block                                                    */
+/* ------------------------------------------------------------------ */
+static u32 dbg_drain_call  = 0;
+static u32 dbg_nonzero_tot = 0;
+static u32 dbg_max_raw     = 0;
+static u32 dbg_min_raw     = 0xFFFFFFFFu;
+static s32 dbg_sum_raw     = 0;
+
 static int drain_audio_block(FIL *fout, u32 *total_audio_bytes)
 {
-    FRESULT fres;
-    UINT bytes_written;
-    u32 i;
+    FRESULT fres; UINT bytes_written; u32 i;
+    u32 nonzero_this = 0;
 
-    /* Cache coherency: audio_ppdma_0 writes AUDIO_DEST_ADDR via the
-     * HP0 port, which bypasses the ARM L1/L2 data cache. Without an
-     * explicit invalidate the CPU may read stale cached content from a
-     * previous read of the same address rather than the fresh data the
-     * PL just wrote to DDR.
-     *
-     * The invalidate MUST come before ANY CPU read of this region --
-     * including the memcpy below. Calling it after the reads (or
-     * omitting it) leaves the cache holding stale data and the PCM
-     * output will be silence or garbage from power-on DDR content.
-     *
-     * Size: AUDIO_SAMPLES_PER_BUFFER * 4 bytes, aligned to cache line
-     * (audio_dest_raw is 64-byte aligned, so this is always correct). */
-    static u32 audio_dest_raw[AUDIO_SAMPLES_PER_BUFFER]
-        __attribute__((aligned(64)));
-
+    /* ---- STEP 1: Cache coherency ----
+     * Invalidate audio_dest_raw BEFORE memcpy so the CPU fetches
+     * fresh cache lines from DDR (written by audio_ppdma_0 via HP0).
+     * Xil_In32 must NOT be used here -- it bypasses cache entirely
+     * so the invalidate would have no effect on it. */
     Xil_DCacheInvalidateRange((INTPTR)audio_dest_raw,
                                sizeof(audio_dest_raw));
 
-    /* Copy from DDR into a local aligned buffer AFTER invalidate, so
-     * the CPU fetches fresh lines from DDR into cache, not stale ones.
-     * Using memcpy (not Xil_In32) means the CPU uses its cached data
-     * path after the invalidate, which is what we want. */
+    /* ---- STEP 2: Read DDR into local buffer via cached path ---- */
     memcpy(audio_dest_raw,
-           (const void *)(uintptr_t)AUDIO_DEST_ADDR,
+           (const void*)(uintptr_t)AUDIO_DEST_ADDR,
            sizeof(audio_dest_raw));
 
-    for (i = 0; i < AUDIO_SAMPLES_PER_BUFFER; i++) {
-        int32_t raw = (int32_t)audio_dest_raw[i];
+    /* ---- STEP 3: Debug -- print raw DDR content for first N drains ---- */
+    if (dbg_drain_call < DBG_DRAIN_RAW_FIRST_N) {
+        xil_printf("[DRAIN#%lu] raw DDR[0..7]: "
+                   "%08lX %08lX %08lX %08lX  %08lX %08lX %08lX %08lX\r\n",
+                   (unsigned long)dbg_drain_call,
+                   (unsigned long)audio_dest_raw[0],
+                   (unsigned long)audio_dest_raw[1],
+                   (unsigned long)audio_dest_raw[2],
+                   (unsigned long)audio_dest_raw[3],
+                   (unsigned long)audio_dest_raw[4],
+                   (unsigned long)audio_dest_raw[5],
+                   (unsigned long)audio_dest_raw[6],
+                   (unsigned long)audio_dest_raw[7]);
 
-        /* sfix32_En13 -> real value, ASSUMED +-1.0 full scale.
-         * Divide by 2^13 = 8192 to get real value in [-1, +1),
-         * then scale to int16 range. */
-        float val    = (float)raw / 8192.0f;
-        float scaled = val * 32767.0f;
-        if (scaled > 32767.0f)  scaled = 32767.0f;
-        if (scaled < -32768.0f) scaled = -32768.0f;
-        audio_pcm_block[i] = (int16_t)lroundf(scaled);
+        /* Also read DIRECTLY via Xil_In32 for comparison -- this shows
+         * whether the cache fix is making a difference.
+         * If Xil_In32 and audio_dest_raw disagree -> cache confirmed active.
+         * If they agree and are zero -> DMA not writing DDR at all.
+         * If they agree and non-zero -> data good, check WAV conversion. */
+        xil_printf("[DRAIN#%lu] Xil_In32[0..3]: "
+                   "%08lX %08lX %08lX %08lX\r\n",
+                   (unsigned long)dbg_drain_call,
+                   (unsigned long)Xil_In32(AUDIO_DEST_ADDR + 0),
+                   (unsigned long)Xil_In32(AUDIO_DEST_ADDR + 4),
+                   (unsigned long)Xil_In32(AUDIO_DEST_ADDR + 8),
+                   (unsigned long)Xil_In32(AUDIO_DEST_ADDR + 12));
     }
 
-    fres = f_write(fout, audio_pcm_block, sizeof(audio_pcm_block), &bytes_written);
+    /* ---- STEP 4: Convert sfix32_En13 -> PCM16 and accumulate stats ----
+     *
+     * The de-emphasis output is in Hz units (instantaneous audio-frequency
+     * deviation after FM demodulation). It is NOT a normalised [-1,+1]
+     * amplitude signal. Typical FM broadcast audio peaks at ~+-75 kHz
+     * deviation; after de-emphasis and audio LPF the audio content sits
+     * in the range approximately +-15000 Hz.
+     *
+     * Correct conversion:
+     *   sfix32_En13 / 8192  -> frequency in Hz  (e.g. +-17000 Hz)
+     *   / FM_MAX_DEV_HZ     -> normalised [-1,+1]
+     *   * 32767             -> PCM16
+     *
+     * The previous code divided by 8192 then multiplied by 32767 directly,
+     * treating it as a +-1 amplitude -- this clips massively because a
+     * 17000 Hz value becomes 17000*32767 = 557M, hard-clipped to 32767
+     * on every sample, producing a square wave at the output.            */
+#define FM_MAX_DEV_HZ  75000.0f   /* ITU-R max FM deviation */
+
+    for (i = 0; i < AUDIO_SAMPLES_PER_BUFFER; i++) {
+        u32 raw_u = audio_dest_raw[i];
+        s32 raw   = (s32)raw_u;
+
+        /* sfix32_En13 -> Hz -> normalised -> PCM16 */
+        float val_hz   = (float)raw / 8192.0f;
+        float val_norm = val_hz / FM_MAX_DEV_HZ;
+        float scaled   = val_norm * 32767.0f;
+        if (scaled >  32767.0f) scaled =  32767.0f;
+        if (scaled < -32768.0f) scaled = -32768.0f;
+        audio_pcm_block[i] = (int16_t)lroundf(scaled);
+
+        /* Accumulate stats for non-zero diagnostic */
+        if (raw_u != 0u) {
+            nonzero_this++;
+            dbg_nonzero_tot++;
+        }
+        if (raw_u > dbg_max_raw) dbg_max_raw = raw_u;
+        if (raw_u < dbg_min_raw) dbg_min_raw = raw_u;
+        dbg_sum_raw += raw;  /* running sum for mean check */
+    }
+
+    /* ---- STEP 5: Per-drain summary for first N drains ---- */
+    if (dbg_drain_call < DBG_DRAIN_RAW_FIRST_N) {
+        xil_printf("[DRAIN#%lu] non-zero=%lu/%lu  pcm[0..3]: %d %d %d %d\r\n",
+                   (unsigned long)dbg_drain_call,
+                   (unsigned long)nonzero_this,
+                   (unsigned long)AUDIO_SAMPLES_PER_BUFFER,
+                   (int)audio_pcm_block[0], (int)audio_pcm_block[1],
+                   (int)audio_pcm_block[2], (int)audio_pcm_block[3]);
+
+        if (nonzero_this == 0) {
+            xil_printf("[DRAIN#%lu] *** ALL ZEROS ***\r\n"
+                       "  If Xil_In32 also zero: DMA not writing DDR\r\n"
+                       "  If Xil_In32 non-zero:  cache coherency bug\r\n"
+                       "  (the fix should have caught this -- check ELF is rebuilt)\r\n",
+                       (unsigned long)dbg_drain_call);
+        }
+    }
+
+    /* ---- STEP 6: Periodic statistics ---- */
+    if ((dbg_drain_call > 0) &&
+        ((dbg_drain_call % DBG_AUDIO_STATS_EVERY) == 0)) {
+        u32 total_samples = dbg_drain_call * AUDIO_SAMPLES_PER_BUFFER;
+        xil_printf("[STATS] blocks=%lu  total_nonzero=%lu/%lu (%.1f%%)\r\n"
+                   "        raw max=0x%08lX  min=0x%08lX  sum=%ld\r\n",
+                   (unsigned long)dbg_drain_call,
+                   (unsigned long)dbg_nonzero_tot,
+                   (unsigned long)total_samples,
+                   (total_samples > 0) ?
+                       (100.0f * dbg_nonzero_tot / total_samples) : 0.0f,
+                   (unsigned long)dbg_max_raw,
+                   (unsigned long)dbg_min_raw,
+                   (long)dbg_sum_raw);
+    }
+
+    /* ---- STEP 7: Write PCM16 to WAV ---- */
+    fres = f_write(fout, audio_pcm_block, sizeof(audio_pcm_block),
+                   &bytes_written);
     if (fres != FR_OK || bytes_written != sizeof(audio_pcm_block)) {
-        xil_printf("drain_audio_block: f_write(%s) failed: %s (%d)\r\n",
-                   INTERMEDIATE_WAV_PATH, fresult_str(fres), fres);
+        xil_printf("[DRAIN] f_write FAILED: %s (%d)\r\n",
+                   fresult_str(fres), fres);
         return -1;
     }
 
     *total_audio_bytes += bytes_written;
+    dbg_drain_call++;
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* main                                                                 */
+/* ------------------------------------------------------------------ */
 int main(void)
 {
-    FRESULT fres;
-    FIL fin, fout;
+    FRESULT fres; FIL fin, fout;
     u32 total_audio_bytes = 0;
-    int input_eof = 0;
-    int draining_grace = 0;
+    int input_eof = 0, draining_grace = 0;
     u32 grace_blocks_remaining = 0;
     u32 iq_prev, audio_prev;
+    u32 iq_refill_count = 0, audio_block_count = 0;
 
     Xil_DCacheEnable();
     Xil_ICacheEnable();
 
-    xil_printf("=== FM Demod bare-metal bring-up (SD card WAV I/O, ping-pong ppdma) ===\r\n");
+    xil_printf("\r\n=== FM Demod bare-metal DEBUG BUILD ===\r\n");
+    xil_printf("Build: %s %s\r\n", __DATE__, __TIME__);
 
-    fres = f_mount(&fatfs, "0:/", 1);
-    if (fres != FR_OK) {
-        xil_printf("f_mount(\"0:/\") failed: %s (%d)\r\n", fresult_str(fres), fres);
-        return -1;
+    /* ---- Print hardware config so we can verify addresses ---- */
+    xil_printf("IQ_PING=0x%08lX  IQ_PONG=0x%08lX\r\n",
+               (unsigned long)IQ_PING_ADDR, (unsigned long)IQ_PONG_ADDR);
+    xil_printf("AUDIO_DEST=0x%08lX  GPIO_BASE=0x%08lX\r\n",
+               (unsigned long)AUDIO_DEST_ADDR,
+               (unsigned long)AXI_GPIO_0_BASEADDR);
+    xil_printf("IQ_BUF_SIZE_WORDS=%lu  AUDIO_SAMPLES_PER_BUF=%lu\r\n",
+               (unsigned long)IQ_BUF_SIZE_WORDS,
+               (unsigned long)AUDIO_SAMPLES_PER_BUFFER);
+
+    /* ---- Confirm GPIO is readable ---- */
+    {
+        u32 gp1 = Xil_In32(AXI_GPIO_0_BASEADDR + GPIO_DATA_OFFSET);
+        u32 gp2 = Xil_In32(AXI_GPIO_0_BASEADDR + GPIO2_DATA_OFFSET);
+        xil_printf("Initial GPIO: ch1(iq)=0x%08lX  ch2(audio)=0x%08lX\r\n",
+                   (unsigned long)gp1, (unsigned long)gp2);
+        if (gp1 == 0xDEADBEEF || gp1 == 0xFFFFFFFF) {
+            xil_printf("*** WARNING: GPIO may not be responding -- "
+                       "check AXI interconnect and bitstream\r\n");
+        }
     }
 
-    /* Show what's actually on the card before trying to open anything --
-     * if INPUT_WAV_PATH is misnamed, wrong-case, or just not there, this
-     * makes that immediately obvious instead of a bare FR_NO_FILE. */
+    /* ---- Confirm AUDIO_DEST_ADDR DDR before we do anything ---- */
+    xil_printf("DDR pre-DMA check at AUDIO_DEST (first 4 words):\r\n"
+               "  [0]=0x%08lX [1]=0x%08lX [2]=0x%08lX [3]=0x%08lX\r\n",
+               (unsigned long)Xil_In32(AUDIO_DEST_ADDR+0),
+               (unsigned long)Xil_In32(AUDIO_DEST_ADDR+4),
+               (unsigned long)Xil_In32(AUDIO_DEST_ADDR+8),
+               (unsigned long)Xil_In32(AUDIO_DEST_ADDR+12));
+
+    /* ---- Mount SD card ---- */
+    fres = f_mount(&fatfs, "0:/", 1);
+    if (fres != FR_OK) {
+        xil_printf("f_mount failed: %s (%d)\r\n", fresult_str(fres), fres);
+        return -1;
+    }
+    xil_printf("SD card mounted OK\r\n");
     list_sd_card_root();
 
+    /* ---- Open input WAV ---- */
     fres = f_open(&fin, INPUT_WAV_PATH, FA_READ);
     if (fres != FR_OK) {
-        xil_printf("Failed to open %s: %s (%d) -- check the directory "
-                   "listing above for the exact filename/case\r\n",
+        xil_printf("f_open(%s) failed: %s (%d)\r\n",
                    INPUT_WAV_PATH, fresult_str(fres), fres);
         return -1;
     }
-    xil_printf("Opened %s (%lu bytes)\r\n", INPUT_WAV_PATH, (unsigned long)f_size(&fin));
+    xil_printf("Opened %s  size=%lu bytes\r\n",
+               INPUT_WAV_PATH, (unsigned long)f_size(&fin));
 
-    if (f_lseek(&fin, sizeof(wav_header_t)) != FR_OK) {
-        xil_printf("Failed to skip %s's WAV header (%lu bytes)\r\n",
-                   INPUT_WAV_PATH, (unsigned long)sizeof(wav_header_t));
-        return -1;
+    /* ---- Print WAV header for verification ---- */
+    {
+        wav_header_t hdr; UINT rb;
+        if (f_read(&fin, &hdr, sizeof(hdr), &rb) == FR_OK && rb == sizeof(hdr)) {
+            xil_printf("WAV header: %.4s  riff_size=%lu  ch=%u  rate=%lu  bps=%u  data_size=%lu\r\n",
+                       hdr.riff_id,
+                       (unsigned long)hdr.riff_size,
+                       (unsigned)hdr.num_channels,
+                       (unsigned long)hdr.sample_rate,
+                       (unsigned)hdr.bits_per_sample,
+                       (unsigned long)hdr.data_size);
+            if (hdr.num_channels != 2) {
+                xil_printf("*** WARNING: expected stereo (ch=2), got ch=%u  "
+                           "-- I/Q must be stereo interleaved\r\n",
+                           (unsigned)hdr.num_channels);
+            }
+            if (hdr.sample_rate != 250000) {
+                xil_printf("*** WARNING: expected 250000 Hz, got %lu Hz\r\n",
+                           (unsigned long)hdr.sample_rate);
+            }
+        } else {
+            xil_printf("*** Could not read WAV header\r\n");
+            /* Seek back to byte 44 anyway */
+        }
+        /* Seek to audio data (skip the 44-byte header) */
+        if (f_lseek(&fin, sizeof(wav_header_t)) != FR_OK) {
+            xil_printf("f_lseek to audio data failed\r\n");
+            return -1;
+        }
+        xil_printf("Seeked to audio data at offset %lu\r\n",
+                   (unsigned long)sizeof(wav_header_t));
     }
 
+    /* ---- Open output WAV ---- */
     fres = f_open(&fout, INTERMEDIATE_WAV_PATH, FA_WRITE | FA_CREATE_ALWAYS);
     if (fres != FR_OK) {
-        xil_printf("Failed to open %s: %s (%d)\r\n",
+        xil_printf("f_open(%s) failed: %s (%d)\r\n",
                    INTERMEDIATE_WAV_PATH, fresult_str(fres), fres);
         return -1;
     }
     if (wav_write_placeholder_header(&fout, 50000, 1, 16) != 0) {
-        xil_printf("Failed to write placeholder WAV header to %s\r\n",
-                   INTERMEDIATE_WAV_PATH);
+        xil_printf("Failed to write placeholder WAV header\r\n");
         return -1;
     }
+    xil_printf("Opened %s for writing\r\n", INTERMEDIATE_WAV_PATH);
 
-    /* Prime BOTH I/Q buffers immediately -- see STARTUP NOTE above:
-     * iq_ppdma_0 is very likely already running against whatever
-     * garbage was in DDR at power-on by the time we get here. This
-     * doesn't eliminate that startup transient (not achievable from
-     * software given ap_start is hardwired high), it just gets real
-     * data in as fast as possible. */
-    {
-        int eof_tmp = 0;
-        refill_iq_buffer(&fin, IQ_PING_ADDR, &eof_tmp);
-        if (eof_tmp) input_eof = 1;
-        refill_iq_buffer(&fin, IQ_PONG_ADDR, &eof_tmp);
-        if (eof_tmp) input_eof = 1;
-    }
+    /* ---- Prime both IQ buffers ---- */
+    xil_printf("Priming IQ_PING ...\r\n");
+    { int e=0; refill_iq_buffer(&fin, IQ_PING_ADDR, &e); if(e) input_eof=1; }
+    xil_printf("Priming IQ_PONG ...\r\n");
+    { int e=0; refill_iq_buffer(&fin, IQ_PONG_ADDR, &e); if(e) input_eof=1; }
 
     iq_prev    = gpio_read_iq_active();
     audio_prev = gpio_read_audio_active();
+    xil_printf("Initial GPIO state: iq_prev=%lu  audio_prev=%lu\r\n",
+               (unsigned long)iq_prev, (unsigned long)audio_prev);
+    xil_printf("Entering main loop...\r\n");
 
-    /* Progress counters, printed only every PROGRESS_PRINT_EVERY_*
-     * events -- deliberately throttled. Printing on every single
-     * refill/drain (every ~10 ms / ~1 ms respectively) would put real
-     * UART transmission time inside the same hot loop whose timing
-     * budget we've already flagged as tight; that would make the very
-     * problem we're trying to debug worse. */
-    u32 iq_refill_count = 0;
-    u32 audio_block_count = 0;
-    #define PROGRESS_PRINT_EVERY_IQ_REFILLS    10u  /* ~100 ms */
-    #define PROGRESS_PRINT_EVERY_AUDIO_BLOCKS 100u  /* ~100 ms */
-
+    /* ---- Main loop ---- */
     for (;;) {
         u32 iq_now = gpio_read_iq_active();
         if (iq_now != iq_prev) {
-            /* Core just switched TO iq_now, i.e. it just finished
-             * reading the OTHER buffer -- that one is now free. */
             u32 free_addr = (iq_now == 0) ? IQ_PONG_ADDR : IQ_PING_ADDR;
             if (!input_eof) {
                 int eof_tmp = 0;
                 refill_iq_buffer(&fin, free_addr, &eof_tmp);
                 iq_refill_count++;
-                if ((iq_refill_count % PROGRESS_PRINT_EVERY_IQ_REFILLS) == 0) {
-                    xil_printf("  [progress] iq refills=%lu\r\n",
-                               (unsigned long)iq_refill_count);
+                if ((iq_refill_count % DBG_IQ_PROGRESS_EVERY) == 0) {
+                    xil_printf("[progress] iq refills=%lu  iq_now=%lu\r\n",
+                               (unsigned long)iq_refill_count,
+                               (unsigned long)iq_now);
                 }
                 if (eof_tmp) {
-                    input_eof = 1;
-                    draining_grace = 1;
+                    input_eof = 1; draining_grace = 1;
                     grace_blocks_remaining = AUDIO_EOF_GRACE_BLOCKS;
-                    xil_printf("Input WAV %s exhausted after %lu refills, "
-                               "draining pipeline (%lu more blocks)...\r\n",
-                               INPUT_WAV_PATH, (unsigned long)iq_refill_count,
+                    xil_printf("[EOF] Input exhausted after %lu refills. "
+                               "Grace drain: %lu blocks\r\n",
+                               (unsigned long)iq_refill_count,
                                (unsigned long)grace_blocks_remaining);
                 }
             }
@@ -494,55 +529,84 @@ int main(void)
         u32 audio_now = gpio_read_audio_active();
         if (audio_now != audio_prev) {
             if (drain_audio_block(&fout, &total_audio_bytes) != 0) {
-                xil_printf("Aborting main loop after %lu audio blocks "
-                           "(%lu bytes written to %s)\r\n",
-                           (unsigned long)audio_block_count,
-                           (unsigned long)total_audio_bytes,
-                           INTERMEDIATE_WAV_PATH);
+                xil_printf("[ABORT] drain_audio_block failed at block %lu\r\n",
+                           (unsigned long)audio_block_count);
                 break;
             }
             audio_block_count++;
-            if ((audio_block_count % PROGRESS_PRINT_EVERY_AUDIO_BLOCKS) == 0) {
-                xil_printf("  [progress] audio blocks=%lu (%lu bytes)\r\n",
+            if ((audio_block_count % DBG_AUDIO_PROGRESS_EVERY) == 0) {
+                xil_printf("[progress] audio blocks=%lu  bytes=%lu\r\n",
                            (unsigned long)audio_block_count,
                            (unsigned long)total_audio_bytes);
             }
-
             if (draining_grace) {
                 if (grace_blocks_remaining == 0) {
-                    xil_printf("Pipeline drain complete after %lu total "
-                               "audio blocks\r\n",
-                               (unsigned long)audio_block_count);
-                    break; /* pipeline flushed, done */
+                    xil_printf("[DONE] Pipeline drain complete. "
+                               "%lu blocks  %lu bytes\r\n",
+                               (unsigned long)audio_block_count,
+                               (unsigned long)total_audio_bytes);
+                    break;
                 }
                 grace_blocks_remaining--;
             }
-
             audio_prev = audio_now;
         }
     }
 
-    if (wav_patch_header(&fout, total_audio_bytes) != 0) {
-        xil_printf("Warning: failed to patch output WAV header\r\n");
+    /* ---- Final statistics ---- */
+    xil_printf("\r\n=== Final statistics ===\r\n");
+    xil_printf("  IQ refills:          %lu\r\n", (unsigned long)iq_refill_count);
+    xil_printf("  Audio blocks:        %lu\r\n", (unsigned long)audio_block_count);
+    xil_printf("  Audio bytes written: %lu\r\n", (unsigned long)total_audio_bytes);
+    xil_printf("  Non-zero audio words: %lu / %lu (%.1f%%)\r\n",
+               (unsigned long)dbg_nonzero_tot,
+               (unsigned long)(audio_block_count * AUDIO_SAMPLES_PER_BUFFER),
+               (audio_block_count * AUDIO_SAMPLES_PER_BUFFER > 0) ?
+               (100.0f * dbg_nonzero_tot /
+                (audio_block_count * AUDIO_SAMPLES_PER_BUFFER)) : 0.0f);
+    xil_printf("  Raw DDR max:         0x%08lX (%ld)\r\n",
+               (unsigned long)dbg_max_raw, (long)(s32)dbg_max_raw);
+    xil_printf("  Raw DDR min:         0x%08lX (%ld)\r\n",
+               (unsigned long)dbg_min_raw, (long)(s32)dbg_min_raw);
+    xil_printf("  Raw DDR sum:         %ld\r\n", (long)dbg_sum_raw);
+
+    if (dbg_nonzero_tot == 0) {
+        xil_printf("\r\n*** DIAGNOSIS: all audio data is zero.\r\n"
+                   "*** Check [DRAIN#0] Xil_In32 values above:\r\n"
+                   "***   If Xil_In32 also zero:  audio_ppdma_0 not writing DDR\r\n"
+                   "***                            Check: ap_start? aresetn?\r\n"
+                   "***   If Xil_In32 non-zero:   cache coherency bug still present\r\n"
+                   "***                            Check: ELF was rebuilt after fix?\r\n");
+    } else {
+        xil_printf("\r\n*** Audio data is NON-ZERO. Signal chain is working.\r\n"
+                   "*** If WAV sounds wrong: check IQ packing order in\r\n"
+                   "***   refill_iq_buffer() -- try swapping (I<<16)|Q to (Q<<16)|I\r\n"
+                   "*** If WAV is correct level but inaudible: check WAV header\r\n"
+                   "***   (sample_rate, num_channels, bits_per_sample above)\r\n");
     }
+
+    /* ---- Patch WAV header and close ---- */
+    if (wav_patch_header(&fout, total_audio_bytes) != 0)
+        xil_printf("Warning: failed to patch WAV header\r\n");
+    else
+        xil_printf("WAV header patched: data_size=%lu\r\n",
+                   (unsigned long)total_audio_bytes);
 
     f_close(&fin);
     f_close(&fout);
+    xil_printf("50kHz WAV: %s (%lu bytes)\r\n",
+               INTERMEDIATE_WAV_PATH, (unsigned long)total_audio_bytes);
 
-    xil_printf("Native-rate pass done: %lu bytes at 50kHz written to %s\r\n",
-               (unsigned long)total_audio_bytes, INTERMEDIATE_WAV_PATH);
-
-    /* Second pass: resample the intermediate 50kHz audio down to the
-     * standard 48kHz rate -- unchanged, no DMA dependency. */
+    /* ---- Resample 50k -> 48k ---- */
+    xil_printf("Resampling %s -> %s ...\r\n",
+               INTERMEDIATE_WAV_PATH, OUTPUT_WAV_PATH);
     if (resample_wav_50k_to_48k(INTERMEDIATE_WAV_PATH, OUTPUT_WAV_PATH) != 0) {
-        xil_printf("Resample pass failed\r\n");
+        xil_printf("Resample FAILED\r\n");
         f_mount(NULL, "0:/", 1);
         return -1;
     }
 
     f_mount(NULL, "0:/", 1);
-
-    xil_printf("Done. Final 48kHz audio written to %s\r\n", OUTPUT_WAV_PATH);
-
+    xil_printf("Done. Output: %s\r\n", OUTPUT_WAV_PATH);
     return 0;
 }
