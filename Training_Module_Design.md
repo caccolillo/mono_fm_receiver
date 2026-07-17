@@ -5271,3 +5271,164 @@ This document has grown from a course design outline to a comprehensive technica
 - Know specifically what HDL Coder, Vitis Model Composer, HDL Verifier, Simulink Test Manager, and Embedded Coder would each have generated from the verified fixed-point Simulink model that was built manually instead
 
 The final lesson of this course is not a technical fact but a methodology: the effort that went into the Simulink fixed-point model — verifying it against a real FM broadcast signal to >40 dB PSNR — was the most valuable work in the entire project. Everything downstream, from the HLS C++ to the VHDL to the testbenches to the bare-metal application, is a consequence of decisions made and verified in that model. The artisan path re-expressed those decisions manually, introducing risk at every step. The licensed tools would have extracted them automatically, eliminating the risk. Understanding which decisions were made where, and what it costs to re-express them, is what this course was built to teach.
+
+---
+
+## Appendix AC — Seven Topics Added After Hardware Bring-Up
+
+---
+
+### AC.1 The AA LPF Is Lowpass, Not Bandpass — and Why
+
+A natural assumption when first reading the signal chain is that the anti-alias LPF exists to remove the −10 kHz carrier offset that SDRuno introduced when recording `rds.wav`. This assumption is wrong, and understanding why matters for anyone designing a similar receiver.
+
+The frequency correction (NCO + complex multiply in `freq_corr.vhd`) is the **first** stage in the signal chain, before the AA LPF. By the time the signal reaches the AA LPF, the −10 kHz carrier offset has already been corrected — the station sits at DC. The AA LPF never sees the offset at all.
+
+The AA LPF's actual job is to limit the **bandwidth** of the I/Q signal before the FM discriminator operates on it. The RTL-SDR captures 250 kHz of bandwidth centred on the LO. After frequency correction, the station sits at DC, but the full ±125 kHz window still contains adjacent channels, wideband noise, and any other RF content the antenna picked up. The FM discriminator computes `atan2(Qdiff, Idiff)` — a phase derivative of the **entire complex spectrum**, not just the station. Without the AA LPF, the discriminator differentiates the phase of everything in that 250 kHz window, producing output corrupted by adjacent channel interference and noise.
+
+The lowpass cutoff is 100 kHz rather than 75 kHz (the maximum FM deviation) deliberately: the 25 kHz gap between them provides a transition band that doesn't attenuate the outermost FM sidebands during loud passages where instantaneous deviation approaches ±75 kHz.
+
+**The conceptual trap for learners:** the −10 kHz correction and the lowpass filter are both "things that happen to the signal" but they solve completely different problems. The NCO corrects a recording artefact (the SDRuno LO offset). The AA LPF suppresses out-of-band content that would corrupt the discriminator. Neither has anything to do with the other.
+
+---
+
+### AC.2 Why the LO Is 10 kHz Above the Station — Reading the SDRuno Screenshot
+
+The `rds.wav` recording was made with SDRuno tuned as follows:
+
+- **Station frequency:** 88.100 MHz (the FM broadcast carrier)
+- **LO (local oscillator):** 88.110 MHz — 10 kHz **above** the station
+
+This offset is deliberate. RTL-SDR dongles have a DC spike at exactly 0 Hz in the baseband caused by LO leakage and self-mixing in the direct-conversion front end. If the LO is tuned exactly to the station, the DC spike sits directly on top of the carrier and corrupts the demodulated audio. By tuning the LO 10 kHz away, the DC spike lands at −10 kHz in the baseband, well clear of the audio band (0–15 kHz).
+
+The consequence: the recorded baseband has the station carrier sitting at **−10 kHz**, not at DC. The spectrum in the SDRuno waterfall shows the characteristic flat-topped FM signal slightly left of centre.
+
+The RDS panel in the screenshot confirms the signal is a real live broadcast: PI 22301, PS "WayFM", PTY Top 40, RT "WAY-FM Uplifting. Upbeat." — the recording contains a full stereo/RDS MPX signal, which is why `rds.wav` carries the pilot tone, stereo subcarrier, and RDS subcarrier described in Appendix A.
+
+**The connection to the FPGA design:** the NCO in the block design is set to exactly +10 kHz to cancel this offset. The DDS PINC value for a 24-bit accumulator at 250 kHz sample rate is `round(10000/250000 × 2²⁴) = 671089`. This is the value hardcoded in the DDS Compiler IP configuration and in `gen_fm_disc_vectors.m`'s NCO timeseries computation (`cos(2π × 10000 × t)`).
+
+---
+
+### AC.3 Why CIC in MATLAB but FIR Decimator in Simulink
+
+The floating-point MATLAB prototype uses a CIC (Cascaded Integrator-Comb) decimator. The Simulink fixed-point model uses a FIR decimator. This is a deliberate change made during the model-based design flow, not an inconsistency.
+
+**Why CIC in MATLAB:** CIC filters require no multipliers — only additions and delays — making them trivially fast to prototype in floating-point. `dsp.CICDecimator` in MATLAB runs without coefficient storage and is ideal for verifying the decimation ratio and checking that the audio band passes cleanly before any fixed-point decisions are made.
+
+**Why FIR decimator in Simulink — three specific reasons:**
+
+**1. Sinc³ passband droop.** A CIC with R=5, N=3 stages has a frequency response of `sinc(f/fs)³`. At 15 kHz relative to a 250 kHz input rate, the droop is approximately 0.6 dB — audible and inconsistent with a flat audio passband. Compensating it requires a separate FIR equaliser, which costs more DSP48 slices than using the FIR decimator directly.
+
+**2. Bit-growth in fixed-point.** A CIC with R=5, N=3 grows the word by `ceil(N × log₂(R)) = ceil(3 × 2.32) = 7 bits`, taking `sfix18_En17` input to a 25-bit intermediate before the comb section. This creates an additional fixed-point format boundary in the Simulink model that Fixed-Point Designer must handle and the RTL must match exactly. The Xilinx FIR Compiler's polyphase structure produces a clean `sfix32_En14` output with no intermediate format.
+
+**3. Simulink/RTL divergence risk.** The HDL Optimized CIC Decimation block in Simulink models bit-growth and integer arithmetic in a way that does not match a bare HLS or VHDL CIC one-to-one. This was a real source of divergence between the golden model and the RTL during development: the CIC's fixed-point behaviour in Simulink produced slightly different results from what the RTL computed, making `verify_fm_demod_rtl.m` harder to interpret. The FIR decimator makes the Simulink block and the Xilinx FIR Compiler IP structurally identical, eliminating that divergence class entirely.
+
+**The resource cost:** the FIR decimator uses ~3 DSP48 slices via polyphase decomposition (9 taps per phase at R=5), compared to zero for a CIC. On the Z7-10's 80-slice budget this is affordable and the payoff — flat passband, clean fixed-point format, Simulink/RTL consistency — is worth it.
+
+---
+
+### AC.4 The Cache Coherency Bug: Simulation Diagnosis and Hardware Fix
+
+#### The symptom
+
+The bare-metal application produced a WAV file of the correct duration but with no intelligible audio. The simulation testbench (`tb_sdr_fm_receiver_audio_check.sv`) showed **250/250 non-zero audio words** at `AUDIO_DEST_ADDR`, meaning the signal chain was producing correct audio in simulation. The only difference between simulation and hardware is the ARM cache.
+
+#### Why simulation confirmed cache coherency
+
+In simulation, the PS7 VIP's HP0 `read_mem` and GP0 `read_data` share the same DDR model with no cache. Reads always see what was last written, regardless of which path wrote it. On real hardware, `audio_ppdma_0` writes via HP0, which bypasses the ARM L1/L2 data cache. The CPU reads via the cached data path. If the cache lines covering `AUDIO_DEST_ADDR` were populated from a previous read (or from power-on DDR content), the CPU reads stale data — silently, with no error.
+
+#### The specific code bug
+
+`drain_audio_block()` called `Xil_DCacheInvalidateRange(AUDIO_DEST_ADDR, ...)` followed by `Xil_In32(AUDIO_DEST_ADDR + i*4)`. This is incoherent: `Xil_In32` is a **direct register-style read that bypasses the cache entirely** — it goes straight to the memory controller without consulting or updating the cache. The `Xil_DCacheInvalidateRange` therefore had no effect on the reads that followed it, because `Xil_In32` doesn't use the cache anyway. The bug would manifest if the CPU had previously populated those cache lines through any other path, because subsequent cached reads of the same addresses would return stale content.
+
+#### The fix
+
+```c
+// WRONG: invalidate then bypass-cache read -- the two operations are incoherent
+Xil_DCacheInvalidateRange((INTPTR)AUDIO_DEST_ADDR, N * sizeof(u32));
+raw = (int32_t)Xil_In32(AUDIO_DEST_ADDR + i * sizeof(u32));
+
+// CORRECT: invalidate then read THROUGH cache using normal pointer
+static u32 audio_dest_raw[AUDIO_SAMPLES_PER_BUFFER] __attribute__((aligned(64)));
+Xil_DCacheInvalidateRange((INTPTR)audio_dest_raw, sizeof(audio_dest_raw));
+memcpy(audio_dest_raw, (const void *)(uintptr_t)AUDIO_DEST_ADDR, sizeof(audio_dest_raw));
+raw = (int32_t)audio_dest_raw[i];
+```
+
+After `Xil_DCacheInvalidateRange`, the next CPU load from that address range fetches fresh data from DDR into cache. The `memcpy` uses the CPU's normal cached load path, so it sees freshly-fetched DDR content written by `audio_ppdma_0` via HP0. This is the correct pattern for CPU-side reads of memory written by a non-coherent PL DMA master.
+
+`refill_iq_buffer()` was already correct: `memcpy` into DDR followed by `Xil_DCacheFlushRange(dest_addr, ...)` is the right pattern for the CPU→PL direction.
+
+#### The diagnostic methodology
+
+The simulation testbench was specifically designed to distinguish cache coherency from signal-chain bugs. In simulation there is no cache — HP0 writes are immediately visible to GP0 reads. If audio data is present in simulation but absent on hardware, the problem is definitively cache coherency and not a signal processing error. This is why the testbench's `audio_check_diagnosis.txt` output specifically states: "If WAV is still wrong on HW → CACHE COHERENCY."
+
+---
+
+### AC.5 The End-to-End SoC Verification Testbench (`tb_sdr_fm_receiver_audio_check.sv`)
+
+This testbench sits above Level 4 (PS7 VIP liveness) in the verification hierarchy, combining the stimulus reuse of Level 3 with the SoC integration of Level 4. It was developed specifically to diagnose the hardware WAV problem.
+
+**What it does that the existing testbenches cannot:**
+
+- Uses the same `s_axis_i_stimulus.txt` / `s_axis_q_stimulus.txt` vectors as `tb_fm_demod_chain.sv`, loading them into IQ_PING/IQ_PONG via PS7 VIP HP0 `write_mem` — exactly as `main.c`'s `refill_iq_buffer()` does
+- Polls `audio_ppdma_0`'s `active_buf` via GPIO after each toggle reads back `AUDIO_DEST_ADDR` and writes to `m_axis_data_dut_output.txt` in the same sfix32_En13 format as `tb_fm_demod_chain.sv` — so `verify_fm_demod_rtl.m` can consume it directly
+- Preserves the `aa_lpf_I_y_dut_output.txt` and `fm_disc_disc_out_dut_output.txt` intermediate logs from `tb_fm_demod_chain.sv`
+- Writes a machine-readable `audio_check_diagnosis.txt` for scripted pass/fail
+
+**The key insight it provides:** if `m_axis_data_dut_output.txt` from this testbench is numerically close to the output from `tb_fm_demod_chain.sv`, the SoC integration (ping-pong DMA, address mapping, GPIO handshake) is bit-exact and any remaining hardware discrepancy is confirmed to be in software (`main.c`).
+
+**XSim 2022.2 reserved-word bugs encountered during development:**
+
+Three variable names caused HDL 9-1206 syntax errors because they are reserved words in Verilog/SystemVerilog:
+- `packed` — a struct/union qualifier keyword
+- `buf` — a gate primitive keyword (like `and`, `or`, `nand`)
+- `int` used as a localparam type — replaced with `integer` throughout
+
+The `ap_start`/`ap_idle` investigation also produced a key finding: in behavioural simulation `ap_start = 1` and `ap_idle = 0` confirmed that the `xlconstant` structural tie-high IS correctly applied in behavioural simulation. The actual cause of the initially-stuck `tvalid` was `peripheral_aresetn` from `proc_sys_reset_0` not having propagated high within the `repeat(500)` post-reset settle — not an `ap_start` issue at all.
+
+---
+
+### AC.6 PetaLinux Build: Failures and Fixes
+
+The PetaLinux build sequence encountered four distinct failures, each worth documenting as a category of build system problem.
+
+**Failure 1 — `openssh` vs `dropbear` conflict:**
+`petalinux-image-minimal` hardcodes `packagegroup-core-ssh-dropbear` in its `IMAGE_INSTALL`, which pulls in `dropbear`. Adding `openssh` to `rootfs_config` creates an unresolvable dnf conflict — both provide `sshd` and cannot coexist. The fix: do not add `openssh`. Keep `dropbear` (the PetaLinux default) and add `dropbear-scp` for file transfer instead. A `bbappend` to remove `packagegroup-core-ssh-dropbear` is the correct mechanism but requires `petalinux-build -c petalinux-image-minimal -x cleansstate` before it takes effect — modifying `rootfs_config` alone does not remove packages hardcoded in the base image recipe.
+
+**Failure 2 — `resample_50k_to_48k.c` not compiled:**
+The scaffolded `Makefile` from `petalinux-create -t apps` only compiles the single `.c` file named after the app. The companion `resample_50k_to_48k.c` was copied into `files/` but not compiled because it was not listed in the `Makefile` OBJS and not in the `.bb` recipe's `SRC_URI`. Fix: write the Makefile from scratch (rather than patching the scaffolded one, whose structure varies between PetaLinux versions) and add `SRC_URI += "file://resample_50k_to_48k.c file://resample_coeffs.h"` to the `.bb` recipe.
+
+**Failure 3 — `FILE*/` comment closing a block comment:**
+`resample_50k_to_48k.c` line 7 contained the text `FILE*/fopen/fread/fwrite` inside a block comment (`/* ... */`). The `*/` terminates the block comment, exposing `/fopen/fread/fwrite).` as bare C syntax. The cross-compiler rejected it with `expected '=', ',', ';', 'asm' or '__attribute__' before '/' token`. Fix: change `FILE*/fopen` to `FILE *, fopen`.
+
+**Failure 4 — `-lgpiod` not found at link time despite `DEPENDS`:**
+The linker reported `undefined reference to gpiod_chip_open_by_name` even though `DEPENDS += "libgpiod"` was in the `.bb` recipe. The root cause was link order: `$(CC) $(LDFLAGS) -o $@ $^` placed libraries before object files. GNU ld resolves symbols left-to-right; libraries must come **after** the object files that reference them. Fix: `$(CC) $(OBJS) $(LDFLAGS) -o $@` — objects first, libraries after. Also add `RDEPENDS:${PN} += "libgpiod"` to ensure `libgpiod.so` is installed on the rootfs at runtime, not just staged for compilation.
+
+---
+
+### AC.7 The `create_sd.sh` Script
+
+A bash script is provided to prepare an SD card for booting the PetaLinux image on the Zybo Z7. Usage:
+
+```bash
+sudo bash create_sd.sh /dev/sdX [path/to/rds.wav]
+```
+
+The script:
+- Refuses to operate on `/dev/sda` or the device containing `/` (system disk protection)
+- Requires explicit `YES` confirmation showing the device size before erasing
+- Unmounts any existing partitions on the target device
+- Creates a single FAT32 partition (256 MB, boot flag set) matching the PetaLinux FIT image layout where `BOOT.BIN` + `image.ub` contain everything including the rootfs
+- Copies `BOOT.BIN` and `image.ub` from `${PETALINUX_PROJECT}/images/linux/`
+- Optionally copies `rds.wav` if provided as a second argument
+- Handles both `/dev/sdX1` and `/dev/mmcblkXp1` partition naming conventions
+- Supports a two-partition layout (`EXT4_ROOTFS=1` at the top of the script) for persistent ext4 rootfs
+
+**After writing the card:**
+1. Set Zybo Z7 jumper JP5 to SD boot mode (pins 1–2)
+2. Connect USB-UART: `sudo minicom -D /dev/ttyUSB0 -b 115200`
+3. Power on — Linux boots in ~30 seconds
+4. Login as root (no password by default)
+5. Run `gpiodetect` and `gpioinfo` to confirm the GPIO chip name and line offsets for `active_buf` before running `fmdemod-linux`
+6. Update `GPIOCHIP_NAME`, `IQ_ACTIVE_LINE`, and `AUDIO_ACTIVE_LINE` in `fmdemod-linux.c` if they differ from the defaults (`gpiochip0`, lines 0 and 1)
