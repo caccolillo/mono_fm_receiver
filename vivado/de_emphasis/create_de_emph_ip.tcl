@@ -6,7 +6,7 @@
 
 set proj_name de_emph_proj
 set proj_dir  [pwd]/de_emph_proj
-set part      xc7z010clg400-1
+set part      xczu3eg-sbva484-1-i
 
 create_project -force ${proj_name} ${proj_dir} -part ${part}
 

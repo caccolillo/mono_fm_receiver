@@ -13,12 +13,12 @@
 #
 # Usage: vivado -mode batch -source fm_demod_ip.tcl
 #
-# Marco Aiello, 2024
 
-# Project identifiers and target part (Zybo Z7-10)
+
+# Project identifiers and target part Ultra96 v2
 set proj_name fm_demod_proj
 set proj_dir  [pwd]/fm_demod_proj
-set part      xc7z010clg400-1
+set part      xczu3eg-sbva484-1-i
 
 # Fresh project, overwriting any previous run in the same directory
 create_project -force ${proj_name} ${proj_dir} -part ${part}
