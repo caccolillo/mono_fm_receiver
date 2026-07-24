@@ -2,13 +2,16 @@
 -- Testbench for nco_wrapper entity.
 -- Tests the two separate AXI4-Stream outputs M_AXIS_COS and M_AXIS_SIN.
 --
--- nco_wrapper ports under test:
+-- nco_wrapper ports under test (updated -- s_axis_config_tvalid never
+-- actually existed, that was a stale/aspirational note; tready ports are
+-- now real, see the fix writeup in nco_wrapper.vhd):
 --   aclk                 : in  std_logic
 --   aresetn              : in  std_logic
---   s_axis_config_tvalid : in  std_logic  (tied '0' = fixed frequency)
 --   m_axis_cos_tdata     : out std_logic_vector(15 downto 0)
 --   m_axis_cos_tvalid    : out std_logic
---   m_axis_cos_tready    : in  std_logic  (tied '1' = always accept)
+--   m_axis_cos_tready    : in  std_logic  (tied '1' here = always accept --
+--                                          this testbench checks DDS math,
+--                                          not stall behavior)
 --   m_axis_sin_tdata     : out std_logic_vector(15 downto 0)
 --   m_axis_sin_tvalid    : out std_logic
 --   m_axis_sin_tready    : in  std_logic  (tied '1' = always accept)
@@ -50,9 +53,16 @@ architecture sim of tb_nco is
 
     signal m_axis_cos_tdata     : std_logic_vector(15 downto 0);
     signal m_axis_cos_tvalid    : std_logic;
+    -- Tied '1': this testbench verifies DDS numerical correctness against
+    -- golden vectors, not stall/backpressure behavior -- that's covered at
+    -- the system level by tb_fm_demod_chain.sv. Always-accept here keeps
+    -- this testbench's scope unchanged now that nco_wrapper genuinely has
+    -- tready ports to drive (see the fix writeup in nco_wrapper.vhd).
+    signal m_axis_cos_tready    : std_logic := '1';
 
     signal m_axis_sin_tdata     : std_logic_vector(15 downto 0);
     signal m_axis_sin_tvalid    : std_logic;
+    signal m_axis_sin_tready    : std_logic := '1';
 
 begin
 
@@ -81,8 +91,10 @@ begin
             aresetn              => aresetn,
             m_axis_cos_tdata     => m_axis_cos_tdata,
             m_axis_cos_tvalid    => m_axis_cos_tvalid,
+            m_axis_cos_tready    => m_axis_cos_tready,
             m_axis_sin_tdata     => m_axis_sin_tdata,
-            m_axis_sin_tvalid    => m_axis_sin_tvalid
+            m_axis_sin_tvalid    => m_axis_sin_tvalid,
+            m_axis_sin_tready    => m_axis_sin_tready
         );
 
     ---------------------------------------------------------------------------

@@ -17,6 +17,19 @@
  * Stimulus / golden files (non-interleaved, one value per line):
  *   matlab_input_stimulus.txt
  *   matlab_golden_output.txt
+ *
+ * Note on control protocol: aa_lpf was switched from ap_ctrl_none to the
+ * default ap_ctrl_hs handshake (see the fix writeup in aa_lpf.cpp) to fix
+ * a confirmed data-loss bug under back-to-back input. That switch is
+ * transparent here -- csim still just calls aa_lpf() once per sample,
+ * exactly as before. ap_start/ap_done/ap_idle/ap_ready only become
+ * visible in the generated RTL/cosim, where ap_start is tied permanently
+ * high in the block design so the block restarts itself the instant it
+ * goes idle. This testbench passing does NOT by itself confirm the fix
+ * -- it only confirms the filter math is still correct, which was never
+ * in question. The fix needs cosim (to catch exactly the kind of
+ * variable-latency/control-protocol issue this bug was) and the Level 3
+ * chain testbench re-run under back-to-back stimulus to actually confirm.
  */
 int main() {
     std::cout << "======================================================" << std::endl;

@@ -80,6 +80,29 @@ set_property CONFIG.Has_Phase_Out  {false}        [get_ips dds_compiler_0]
 set_property CONFIG.Has_ARESETn    {true}         [get_ips dds_compiler_0]
 set_property CONFIG.DATA_Has_TLAST {Not_Required} [get_ips dds_compiler_0]
 
+# BACKPRESSURE FIX (Ultra96-V2 bring-up): Has_TREADY was previously left at
+# its default (false) -- confirmed by nco_wrapper.vhd's own header comment
+# ("No tready port on DDS (Has_TREADY=false in IP config)") and by the fact
+# that dds_compiler_0's instantiation in nco_wrapper.vhd never even had a
+# tready port to connect. That was a valid assumption ONLY as long as
+# downstream (freq_corr_0) also ignored backpressure, which it did until
+# its own separate bug was fixed (see freq_corr.vhd). Once freq_corr_0
+# started correctly stalling during real backpressure, this DDS core kept
+# advancing its phase accumulator regardless -- confirmed on real hardware
+# as a strong, near-constant spurious tone (flat envelope, ~1 kHz + clean
+# harmonics) even after both aa_lpf and freq_corr's data-loss bugs were
+# independently fixed and verified lossless. Root cause: cos/sin drifting
+# out of correspondence with the I/Q sample they're meant to pair with,
+# every time freq_corr_0 stalls and this DDS core doesn't.
+#
+# Has_TREADY=true makes the DDS Compiler's own phase accumulator only
+# advance on cycles where m_axis_data_tvalid AND m_axis_data_tready are
+# both asserted -- genuine AXI-Stream master semantics, matching what
+# nco_wrapper.vhd's original (never-implemented) header comment already
+# described as the intended design ("tready is AND-ed: DDS holds until
+# both consumers have accepted").
+set_property CONFIG.Has_TREADY {true} [get_ips dds_compiler_0]
+
 # Step 5: latency
 set_property CONFIG.Latency_Configuration {Configurable} [get_ips dds_compiler_0]
 set_property CONFIG.Latency               {8}            [get_ips dds_compiler_0]

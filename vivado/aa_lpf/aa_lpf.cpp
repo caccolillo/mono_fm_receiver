@@ -21,6 +21,48 @@
  * sample -- comfortably inside the 400-cycle budget at 100 MHz clock vs.
  * 250 kHz sample rate, while using only a handful of DSP48 slices.
  *
+ * CONTROL PROTOCOL FIX (Ultra96-V2 hardware bring-up): this block was
+ * previously ap_ctrl_none. That's WRONG for this design and caused a
+ * confirmed, severe data-loss bug -- measured on real hardware as 5000
+ * input samples fed back-to-back producing only 2 output samples, and
+ * reproduced in isolated RTL simulation of just this block (same ~5000
+ * in / ~21 out collapse). Root cause: aa_lpf carries persistent internal
+ * state (shift_reg, static, below) and takes ~129 cycles to fully process
+ * one sample through SHIFT_Loop + MAC_Loop. ap_ctrl_none generates NO
+ * ap_start/ap_idle/ap_ready handshake, so nothing gates s_axis_x's tready
+ * to reflect that the core is still mid-computation -- it kept accepting
+ * a new x sample almost every cycle, overwriting shift_reg/acc before the
+ * previous sample had finished propagating through, well before the true
+ * ~129-cycle-per-sample datapath could retire it. Xilinx's own HLS
+ * documentation says ap_ctrl_none should only be used for designs with NO
+ * such internal sequencing dependency -- this block never qualified.
+ *
+ * This project already found and fixed the exact same ap_ctrl_none
+ * mistake once before, in audio_ppdma/iq_ppdma (see the control-protocol
+ * comment in audio_ppdma.cpp) -- that fix just never got applied here.
+ * Same fix, same reasoning: switch to the DEFAULT ap_ctrl_hs block-level
+ * handshake (removing the ap_ctrl_none INTERFACE pragma below is enough;
+ * omitting it is what makes HLS default to ap_ctrl_hs) and tie ap_start
+ * permanently high via an xlconstant on both aa_lpf_I and aa_lpf_Q in the
+ * fm_demod block design (vivado/fm_demod/bd.tcl) -- same pattern already
+ * used for audio_ppdma_0/iq_ppdma_0's ap_start there. With ap_start tied
+ * high, the block re-enters and restarts itself the instant it goes idle,
+ * genuinely gating each new x sample behind the previous invocation's real
+ * completion -- no CPU/software involvement required, and no more silent
+ * overwrite of in-flight state.
+ *
+ * REQUIRED companion fix, not optional: see the #pragma HLS RESET on
+ * shift_reg below. Vitis HLS's default reset scope only covers the
+ * ap_ctrl_hs control FSM, NOT data-path static variables -- this project
+ * already hit this exact gap once too (audio_ppdma's cur_buf/widx left
+ * reading X throughout cosim without it). shift_reg is exactly the same
+ * class of static, data-path state, and needs the same explicit reset.
+ *
+ * This needs the full csim -> csynth -> cosim -> Level 2.5/3 verification
+ * sequence this project already uses for every other HLS block, not just
+ * a recompile -- flagging that explicitly since it can't be validated
+ * without the Vitis HLS toolchain itself.
+ *
  * @param x : Incoming data sample, fixdt(1,18,17) format. AXI-S slave.
  * @param y : Filtered output sample, fixdt(1,18,17) with saturation. AXI-S master.
  */
@@ -28,10 +70,13 @@ void aa_lpf(data_t &x, data_t &y) {
 
     #pragma HLS INTERFACE mode=axis port=x
     #pragma HLS INTERFACE mode=axis port=y
-    #pragma HLS INTERFACE mode=ap_ctrl_none port=return
+    // No ap_ctrl_none here -- default ap_ctrl_hs, driven free-running by
+    // tying ap_start permanently high in the block design. See the fix
+    // writeup above.
 
     // Single-channel tapped delay line
     static data_t shift_reg[NTAPS] = {0};
+    #pragma HLS RESET variable=shift_reg
 
     // Shift the delay line and insert the new sample first.
     SHIFT_Loop:

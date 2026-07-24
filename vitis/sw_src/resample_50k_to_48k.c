@@ -21,14 +21,16 @@
  *
  * This implementation buffers the whole input signal in RAM, which is
  * the simplest correct approach for a batch WAV-to-WAV conversion (a
- * few minutes of 50 kHz mono 16-bit audio is a few MB - trivial on a
- * Zybo Z7-20's DDR). For very long recordings where that's no longer
- * true, this would need to become a streaming version with a small
+ * few minutes of 50 kHz mono 16-bit audio is a few MB - trivial on the
+ * Ultra96-V2's on-module DDR). For very long recordings where that's no
+ * longer true, this would need to become a streaming version with a small
  * (taps_per_phase-sample) history ring buffer instead - the per-sample
  * math is identical, only the buffering strategy changes.
  *
- * Uses the Cortex-A9's hardware FPU (VFPv3) via plain float math - no
- * fixed-point needed for a non-real-time batch job like this.
+ * Uses the PS's hardware FPU via plain float math - no fixed-point
+ * needed for a non-real-time batch job like this. (Originally written
+ * against the Zybo Z7's Cortex-A9/VFPv3; ZU+'s Cortex-A53 FPU handles
+ * the same plain-float code path fine, this is a doc-only update.)
  */
 
 #include "resample_coeffs.h"
@@ -38,6 +40,18 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+
+/* ------------------------------------------------------------------ */
+/* SD write/readback cross-check checksum                              */
+/* MUST STAY IDENTICAL to the copy of this function in main.c -- see    */
+/* the full explanation there. This side computes it over in_buf right  */
+/* after reading A50.WAV back from the SD card; main.c computed the     */
+/* same checksum over the same samples as it originally wrote them.     */
+/* ------------------------------------------------------------------ */
+static uint32_t sd_checksum_update(uint32_t crc, int16_t sample)
+{
+    return ((crc << 1) | (crc >> 31)) + (uint32_t)(uint16_t)sample;
+}
 
 /* --- core sample-rate-conversion math ------------------------------- */
 
@@ -219,6 +233,21 @@ int resample_wav_50k_to_48k(const char *in_path, const char *out_path)
         goto cleanup_in_buf;
     }
     f_close(&fin);
+
+    /* SD readback checksum -- compare against main.c's "SD write
+     * checksum" printed at the end of its run. Computed over in_buf in
+     * the exact same order/values main.c wrote them in; a match rules
+     * out SD-level corruption on this write-then-reopen-and-read round
+     * trip, a mismatch confirms it independent of anything upstream. */
+    {
+        uint32_t sd_readback_checksum = 0;
+        int k;
+        for (k = 0; k < n_in; k++) {
+            sd_readback_checksum = sd_checksum_update(sd_readback_checksum, in_buf[k]);
+        }
+        xil_printf("resample: SD readback checksum: 0x%08lX  (compare against main.c's \"SD write checksum\" -- match = SD round-trip clean, mismatch = corruption confirmed right here)\r\n",
+                   (unsigned long)sd_readback_checksum);
+    }
 
     /* n_out ~= n_in * L / M, allocate with a small safety margin */
     max_out = (int)(((int64_t)n_in * RESAMP_L) / RESAMP_M) + 4;

@@ -125,21 +125,33 @@ if { $validate_required } {
 }
 
 # Create project
-create_project ${_xil_proj_name_} ./${_xil_proj_name_} -part xc7z010clg400-1
+# NOTE: Ultra96-V2 board files (Avnet) must be installed in Vivado's
+# board_part repository before this will resolve -- clone
+# github.com/Avnet/bdf and copy its ultra96v2/ folder into
+# <vivado_install>/data/boards/board_files, then confirm with
+#   get_board_parts -quiet *ultra96v2*
+# in the Tcl console before running this script. The VLNV below uses the
+# current "avnet.com" vendor prefix -- the older "em.avnet.com" prefix
+# used in some tutorials is deprecated and will fail the same way "board
+# not found" does even once the files ARE installed, so if this still
+# errors after installing, run get_board_parts and copy the exact string
+# it reports (file version may be 1.1, 1.2, or 1.3 depending on which
+# BDF release you cloned) rather than assuming 1.2 is right.
+create_project ${_xil_proj_name_} ./${_xil_proj_name_} -part xczu3eg-sbva484-1-i
 
 # Set the directory path for the new project
 set proj_dir [get_property directory [current_project]]
 
 # Set project properties
 set obj [current_project]
-set_property -name "board_part" -value "digilentinc.com:zybo-z7-10:part0:1.2" -objects $obj
+set_property -name "board_part" -value "avnet.com:ultra96v2:part0:1.2" -objects $obj
 set_property -name "default_lib" -value "xil_defaultlib" -objects $obj
 set_property -name "enable_resource_estimation" -value "0" -objects $obj
 set_property -name "enable_vhdl_2008" -value "1" -objects $obj
 set_property -name "ip_cache_permissions" -value "read write" -objects $obj
 set_property -name "ip_output_repo" -value "$proj_dir/${_xil_proj_name_}.cache/ip" -objects $obj
 set_property -name "mem.enable_memory_map_generation" -value "1" -objects $obj
-set_property -name "platform.board_id" -value "zybo-z7-10" -objects $obj
+set_property -name "platform.board_id" -value "ultra96v2" -objects $obj
 set_property -name "revised_directory_structure" -value "1" -objects $obj
 set_property -name "sim.central_dir" -value "$proj_dir/${_xil_proj_name_}.ip_user_files" -objects $obj
 set_property -name "sim.ip.auto_export_scripts" -value "1" -objects $obj
@@ -245,7 +257,7 @@ catch {
 
 # Create 'synth_1' run (if not found)
 if {[string equal [get_runs -quiet synth_1] ""]} {
-    create_run -name synth_1 -part xc7z010clg400-1 -flow {Vivado Synthesis 2022} -strategy "Vivado Synthesis Defaults" -report_strategy {No Reports} -constrset constrs_1
+    create_run -name synth_1 -part xczu3eg-sbva484-1-i -flow {Vivado Synthesis 2022} -strategy "Vivado Synthesis Defaults" -report_strategy {No Reports} -constrset constrs_1
 } else {
   set_property strategy "Vivado Synthesis Defaults" [get_runs synth_1]
   set_property flow "Vivado Synthesis 2022" [get_runs synth_1]
@@ -271,7 +283,7 @@ current_run -synthesis [get_runs synth_1]
 
 # Create 'impl_1' run (if not found)
 if {[string equal [get_runs -quiet impl_1] ""]} {
-    create_run -name impl_1 -part xc7z010clg400-1 -flow {Vivado Implementation 2022} -strategy "Vivado Implementation Defaults" -report_strategy {No Reports} -constrset constrs_1 -parent_run synth_1
+    create_run -name impl_1 -part xczu3eg-sbva484-1-i -flow {Vivado Implementation 2022} -strategy "Vivado Implementation Defaults" -report_strategy {No Reports} -constrset constrs_1 -parent_run synth_1
 } else {
   set_property strategy "Vivado Implementation Defaults" [get_runs impl_1]
   set_property flow "Vivado Implementation 2022" [get_runs impl_1]

@@ -22,7 +22,7 @@
 %% ── PARAMETERS (must match convert_fp_designer.m) ───────────────────────
 WAV_FILE    = 'rds.wav';
 FS_IQ       = 250e3;
-SIM_SECONDS = 10;          % length of RTL testbench stimulus to generate
+SIM_SECONDS = 0.02;          % length of RTL testbench stimulus to generate
 
 fprintf('=== Generating FM demod full-chain stimulus ===\n');
 

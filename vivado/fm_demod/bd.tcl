@@ -410,6 +410,30 @@ proc create_root_design { parentCell } {
   # Create instance: nco_0, and set properties
   set nco_0 [ create_bd_cell -type ip -vlnv marco-aiello:fm_receiver:nco:1.0 nco_0 ]
 
+  # Create instance: xlconstant_aa_lpf_ap_start, and set properties
+  #
+  # NEW as of the ap_ctrl_none -> ap_ctrl_hs fix (see the writeup in
+  # aa_lpf.cpp). aa_lpf_I/aa_lpf_Q did not have an ap_start pin at all
+  # under ap_ctrl_none -- the regenerated IP now exposes one on each
+  # instance, and it needs to be tied permanently high, same pattern
+  # already used in end_system/bd.tcl for audio_ppdma_0/iq_ppdma_0's
+  # ap_start (that one's xlconstant_0 is in a different block design's
+  # scope -- end_system, not this inner fm_demod one -- so it can't be
+  # reused directly; this is a new instance local to this BD).
+  # Default xlconstant properties (CONST_WIDTH=1, CONST_VAL=1) are
+  # exactly what's needed here, so no explicit set_property call.
+  #
+  # VERIFY: "ap_start" is the standard/expected pin name Vitis HLS
+  # generates for ap_ctrl_hs designs, matching audio_ppdma_0/iq_ppdma_0
+  # elsewhere in this project -- but this hasn't been confirmed against
+  # the actual regenerated aa_lpf IP yet (no HLS toolchain available to
+  # verify from here). Open aa_lpf_I in the block design's Customize IP
+  # dialog, or check the regenerated component.xml/wrapper port list,
+  # once csynth has actually run -- if the pin is named differently,
+  # fix the two connect_bd_net references below to match before running
+  # this script.
+  set xlconstant_aa_lpf_ap_start [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 xlconstant_aa_lpf_ap_start ]
+
   # Create interface connections
   connect_bd_intf_net -intf_net aa_lpf_0_y [get_bd_intf_pins aa_lpf_I/y] [get_bd_intf_pins fm_disc_0/ic]
   connect_bd_intf_net -intf_net aa_lpf_1_y [get_bd_intf_pins aa_lpf_Q/y] [get_bd_intf_pins fm_disc_0/qc]
@@ -433,6 +457,11 @@ proc create_root_design { parentCell } {
   connect_bd_net -net freq_corr_0_m_axis_ic_tvalid [get_bd_pins aa_lpf_I/x_TVALID] [get_bd_pins freq_corr_0/m_axis_ic_tvalid]
   connect_bd_net -net freq_corr_0_m_axis_qc_tvalid [get_bd_pins aa_lpf_Q/x_TVALID] [get_bd_pins freq_corr_0/m_axis_qc_tvalid]
   connect_bd_net -net xlconcat_0_dout [get_bd_pins I_adapter/dout] [get_bd_pins aa_lpf_I/x_TDATA]
+
+  # NEW: tie aa_lpf_I/aa_lpf_Q's ap_start permanently high -- see the
+  # xlconstant_aa_lpf_ap_start creation comment above for the full
+  # explanation and the pin-name verification caveat.
+  connect_bd_net -net xlconstant_aa_lpf_ap_start_dout [get_bd_pins aa_lpf_I/ap_start] [get_bd_pins aa_lpf_Q/ap_start] [get_bd_pins xlconstant_aa_lpf_ap_start/dout]
 
   # Create address segments
 
