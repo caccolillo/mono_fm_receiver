@@ -32,7 +32,7 @@ set_property simulator_language Mixed [current_project]
 # sub-block's packaged IP lives, then rescan so they appear in the
 # IP Catalog and can be instantiated by name in the block design.
 set_property  ip_repo_paths  ../ [current_project]
-update_ip_catalog
+update_ip_catalog -rebuild
 
 # bd.tcl contains the actual block design: instantiates each custom IP
 # (NCO, FreqCorr, AA LPF x2 for I/Q, FM discriminator, FIR decimator,

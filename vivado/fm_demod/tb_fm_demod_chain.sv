@@ -2,11 +2,26 @@
 // tb_fm_demod_chain.sv
 // Full-chain behavioral testbench for fm_demod_wrapper.
 //
+// MODIFIED: feeds I/Q BACK-TO-BACK (as fast as the DUT will accept),
+// properly respecting s_axis_i_0_tready / s_axis_q_0_tready, instead of
+// the original fixed-400-cycle-gap (paced 250 kHz) feed. The paced
+// version proved the chain's decimation ratio is correct at its designed
+// input rate (5000 in -> 997 out, ~1/5 as expected) but never actually
+// exercised the DUT's tready handshaking at all, since 400 cycles is
+// always more than enough time regardless of internal pipeline behavior.
+// This is a closer match to how iq_ppdma_0 actually drives this
+// interface on real hardware: free-running, back-to-back, no pacing.
+// If s_axis_i_0_tready/s_axis_q_0_tready ever go low under this load,
+// that's direct proof this input boundary imposes real backpressure and
+// isn't the (assumed) always-ready case the paced version implicitly
+// tested. Stall-cycle counting added below to make that visible/
+// quantifiable rather than just pass/fail.
+//
 // Drives s_axis_i_0 / s_axis_q_0 with real captured I/Q samples from
-// rds.wav (quantised to sfix16_En15 by gen_fm_demod_stimulus.m), at the
-// 250 kHz sample rate the chain expects. The on-chip nco_0 (DDS Compiler
-// v6.0, +10 kHz, configured by create_nco_sim.tcl) generates its own
-// cos/sin internally -- no external NCO stimulus is needed.
+// rds.wav (quantised to sfix16_En15 by gen_fm_demod_stimulus.m).
+// The on-chip nco_0 (DDS Compiler v6.0, +10 kHz, configured by
+// create_nco_sim.tcl) generates its own cos/sin internally -- no
+// external NCO stimulus is needed.
 //
 // Captures m_axis_data_0 (de-emphasis output, sfix32_En13, 50 kHz) to a
 // text file of stored integers for MATLAB to read, resample to 48 kHz,
@@ -18,8 +33,10 @@
 // if the wrapper differs, adjust M_DATA_WIDTH and the port map below.
 //
 // Clock: 100 MHz (10 ns period), matching every sub-block's aclk.
-// Input sample period: 250 kHz -> 400 clock cycles between samples,
-// consistent with SAMPLE_RATE used throughout the per-block testbenches.
+// NOTE: SAMPLE_RATE / the old 400-cycle gap is now UNUSED for pacing --
+// left defined below only because other comments in this file still
+// reference it for context; the stimulus loop itself no longer inserts
+// any fixed delay between samples.
 //
 // Marco Aiello, 2024
 //------------------------------------------------------------------------------
@@ -40,6 +57,7 @@ module tb_fm_demod_chain;
     localparam string AUDIO_OUT_FILE = "m_axis_data_dut_output.txt";
     localparam string AA_I_LOG_FILE  = "aa_lpf_I_y_dut_output.txt";
     localparam string FM_DISC_LOG_FILE = "fm_disc_disc_out_dut_output.txt";
+    localparam string FREQ_CORR_LOG_FILE = "freq_corr_0_m_axis_ic_dut_output.txt";
 
     // AA_I output: y is sfix18_En17 (18 bits), padded to 24-bit TDATA by
     // HLS's AXI-Stream byte-alignment (see earlier discussion on x_TDATA[23:0]
@@ -112,14 +130,19 @@ module tb_fm_demod_chain;
     );
 
     //--------------------------------------------------------------------------
-    // Stimulus: feed I and Q together at 250 kHz, matching the per-block
-    // testbench pattern used throughout (see tb_freq_corr.vhd).
+    // Stimulus: feed I and Q BACK-TO-BACK, respecting s_axis_i_0_tready /
+    // s_axis_q_0_tready like a real AXI-Stream master must -- holding
+    // tdata/tvalid stable across any stall cycles rather than firing and
+    // forgetting after a fixed delay. This is the closer match to how
+    // iq_ppdma_0 actually drives this interface on real hardware.
     //--------------------------------------------------------------------------
     initial begin : stim_proc
         int fd_i, fd_q;
         int vi, vq;
         int code_i, code_q;
         int n_fed;
+        longint stall_cycles;
+        int this_sample_stalls;
 
         fd_i = $fopen(I_STIM_FILE, "r");
         fd_q = $fopen(Q_STIM_FILE, "r");
@@ -129,6 +152,7 @@ module tb_fm_demod_chain;
         end
 
         n_fed = 0;
+        stall_cycles = 0;
         wait (aresetn_0 == 1'b1);
         @(posedge aclk_0);
 
@@ -145,23 +169,41 @@ module tb_fm_demod_chain;
             s_axis_i_tvalid <= 1'b1;
             s_axis_q_tvalid <= 1'b1;
 
+            // Handshake: the transfer completes on the first clock edge
+            // where BOTH tready signals sample high while tvalid is
+            // asserted. Until then, tdata/tvalid MUST stay held exactly
+            // as they are -- this is the part the original fixed-delay
+            // version never had to do, since 400 cycles was always more
+            // than enough regardless of whether the DUT was really ready.
+            this_sample_stalls = 0;
             @(posedge aclk_0);
+            while (!(s_axis_i_tready && s_axis_q_tready)) begin
+                stall_cycles++;
+                this_sample_stalls++;
+                @(posedge aclk_0);
+            end
+
             s_axis_i_tvalid <= 1'b0;
             s_axis_q_tvalid <= 1'b0;
 
-            repeat (SAMPLE_RATE - 1) @(posedge aclk_0);
-
             n_fed++;
             if (n_fed % 1000 == 0) begin
-                $display("Stimulus progress: sample %0d (%0.3f ms of input) -- I=%0d Q=%0d",
-                          n_fed, n_fed / 250.0, vi, vq);
+                $display("Stimulus progress (back-to-back): sample %0d -- I=%0d Q=%0d  (stall cycles so far: %0d, this sample: %0d)",
+                          n_fed, vi, vq, stall_cycles, this_sample_stalls);
             end
         end
 
         $fclose(fd_i);
         $fclose(fd_q);
 
-        $display("Stimulus complete: %0d I/Q samples fed.", n_fed);
+        $display("Stimulus complete (back-to-back): %0d I/Q samples fed.", n_fed);
+        $display("Total stall cycles: %0d (%0d.%0d avg per sample) -- %s",
+                  stall_cycles,
+                  (n_fed > 0) ? (stall_cycles / n_fed) : 0,
+                  (n_fed > 0) ? ((stall_cycles * 10 / n_fed) % 10) : 0,
+                  (stall_cycles == 0) ?
+                      "DUT NEVER stalled -- input side accepted everything back-to-back" :
+                      "DUT applied real backpressure at least once -- see per-sample stalls above");
 
         // Allow pipeline to flush through all stages (NCO + FreqCorr + AA LPF
         // x2 + FM disc + FIR dec + Audio LPF + De-emph latencies combined)
@@ -220,6 +262,107 @@ module tb_fm_demod_chain;
         $fclose(fd_aai);
         $display("AA_I log complete: %0d samples written to %s",
                   n_logged, AA_I_LOG_FILE);
+    end
+
+    //--------------------------------------------------------------------------
+    // freq_corr_0 OUTPUT handshake diagnostic: added specifically because
+    // switching aa_lpf from ap_ctrl_none to ap_ctrl_hs (see aa_lpf.cpp)
+    // had ZERO effect on the observed collapse (still 5000 in / 21 AA_I /
+    // 2 audio out, byte-identical to before the fix, confirmed on a
+    // genuinely fresh rebuild+resim -- not a stale-cache artifact).
+    //
+    // Realization: the testbench's s_axis_i_0/s_axis_q_0 tready, which
+    // showed near-zero stalling throughout every back-to-back run so far,
+    // is freq_corr_0's tready, NOT aa_lpf's -- per bd.tcl, s_axis_i_0
+    // feeds freq_corr_0 first, and ONLY freq_corr_0's own output feeds
+    // aa_lpf. Every prior "input side never stalls" conclusion was really
+    // "freq_corr_0 never stalls", which says nothing about whether
+    // aa_lpf's (now-fixed) tready is being correctly honored one hop
+    // further upstream.
+    //
+    // This logs EVERY cycle where freq_corr_0/m_axis_ic_tvalid is
+    // asserted, regardless of whether m_axis_ic_tready was also high --
+    // i.e. it captures both accepted AND rejected beats, unlike the
+    // AA_I/fm_disc logs above which only ever record accepted samples.
+    // That's the point: if freq_corr_0 is a correct AXI-Stream master,
+    // tdata must stay IDENTICAL across any run of consecutive
+    // tvalid=1/tready=0 log lines (holding the same not-yet-accepted
+    // beat steady). If tdata instead changes between them, that's a
+    // direct, unambiguous protocol violation -- freq_corr_0 overwriting
+    // presented-but-not-yet-accepted data instead of holding it, which
+    // would produce exactly this kind of silent, upstream-of-aa_lpf data
+    // loss no matter how correct aa_lpf's own tready handling is.
+    //
+    // Logs one line per cycle where tvalid=1: "<cycle_index> <tvalid> <tready> <tdata>"
+    //--------------------------------------------------------------------------
+    initial begin : freq_corr_log_proc
+        int fd_fc;
+        int n_logged;
+        int n_rejected;
+        // WIDTH NOTE: freq_corr_0/m_axis_ic_tdata's true native width isn't
+        // confirmed here (freq_corr.vhd isn't available to check directly
+        // -- same archive gap as fm_disc/). Using AA_I_DATA_WIDTH (24) as a
+        // safe upper bound; if the real signal is narrower (plausible,
+        // e.g. 18-bit sfix18_En17 before I_adapter pads it for aa_lpf's
+        // AXI-S TDATA), this just reads high bits as 0 -- harmless for the
+        // tdata-changed-while-rejected check below, which only cares
+        // whether consecutive captures differ, not their absolute width.
+        logic [AA_I_DATA_WIDTH-1:0] tdata_val;
+        logic prev_tready_was_0;
+        logic [AA_I_DATA_WIDTH-1:0] prev_tdata_val;
+
+        fd_fc = $fopen(FREQ_CORR_LOG_FILE, "w");
+        if (fd_fc == 0) begin
+            $error("Could not open freq_corr_0 log file: %s", FREQ_CORR_LOG_FILE);
+            $finish;
+        end
+
+        n_logged = 0;
+        n_rejected = 0;
+        prev_tready_was_0 = 1'b0;
+        prev_tdata_val = '0;
+        wait (aresetn_0 == 1'b1);
+
+        forever begin
+            @(posedge aclk_0);
+            if (dut.fm_demod_i.freq_corr_0.m_axis_ic_tvalid) begin
+                tdata_val = dut.fm_demod_i.freq_corr_0.m_axis_ic_tdata;
+                $fdisplay(fd_fc, "%0d %0d %0d %0d",
+                          n_logged,
+                          dut.fm_demod_i.freq_corr_0.m_axis_ic_tvalid,
+                          dut.fm_demod_i.freq_corr_0.m_axis_ic_tready,
+                          tdata_val);
+
+                if (!dut.fm_demod_i.freq_corr_0.m_axis_ic_tready) begin
+                    n_rejected++;
+                    // PROTOCOL CHECK: if the previous logged beat was also
+                    // rejected (tready=0), tdata MUST be unchanged from
+                    // that previous beat -- a real AXI-Stream master holds
+                    // a presented-but-unaccepted beat steady. A mismatch
+                    // here is the direct, unambiguous smoking gun.
+                    if (prev_tready_was_0 && (tdata_val !== prev_tdata_val)) begin
+                        $display("*** PROTOCOL VIOLATION at cycle %0d: freq_corr_0/m_axis_ic changed tdata (0x%0h -> 0x%0h) while tready was LOW across consecutive beats -- master is overwriting rejected data instead of holding it ***",
+                                  n_logged, prev_tdata_val, tdata_val);
+                    end
+                    prev_tready_was_0 = 1'b1;
+                end else begin
+                    prev_tready_was_0 = 1'b0;
+                end
+                prev_tdata_val = tdata_val;
+
+                n_logged++;
+                if (n_logged % 10000 == 0) begin
+                    $display("freq_corr_0 m_axis_ic log progress: %0d beats (%0d rejected so far)",
+                              n_logged, n_rejected);
+                end
+            end
+
+            if (stim_done) break;
+        end
+
+        $fclose(fd_fc);
+        $display("freq_corr_0 m_axis_ic log complete: %0d total beats, %0d rejected (tvalid=1,tready=0), %0d accepted -- written to %s",
+                  n_logged, n_rejected, n_logged - n_rejected, FREQ_CORR_LOG_FILE);
     end
 
     //--------------------------------------------------------------------------

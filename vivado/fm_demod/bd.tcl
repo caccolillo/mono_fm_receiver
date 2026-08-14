@@ -392,6 +392,14 @@ proc create_root_design { parentCell } {
   # Create instance: aa_lpf_Q, and set properties
   set aa_lpf_Q [ create_bd_cell -type ip -vlnv Marco_Aiello:hls:aa_lpf:1.0 aa_lpf_Q ]
 
+  # CONTROL PROTOCOL FIX: aa_lpf switched from ap_ctrl_none to ap_ctrl_hs
+  # (see aa_lpf.cpp). The regenerated IP now exposes ap_start on both
+  # aa_lpf_I and aa_lpf_Q. Tie it permanently high so the block restarts
+  # itself the instant it goes idle -- same pattern as audio_ppdma_0/
+  # iq_ppdma_0 in end_system/bd.tcl.
+  # Default xlconstant properties (CONST_WIDTH=1, CONST_VAL=1) are correct.
+  set xlconstant_aa_lpf_ap_start [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 xlconstant_aa_lpf_ap_start ]
+
   # Create instance: audio_lpf_0, and set properties
   set audio_lpf_0 [ create_bd_cell -type ip -vlnv Marco_Aiello:user:audio_lpf:1.0 audio_lpf_0 ]
 
@@ -427,6 +435,7 @@ proc create_root_design { parentCell } {
   connect_bd_net -net In0_1 [get_bd_pins I_adapter1/In0] [get_bd_pins freq_corr_0/m_axis_qc_tdata]
   connect_bd_net -net aa_lpf_0_x_TREADY [get_bd_pins aa_lpf_I/x_TREADY] [get_bd_pins freq_corr_0/m_axis_ic_tready]
   connect_bd_net -net aa_lpf_1_x_TREADY [get_bd_pins aa_lpf_Q/x_TREADY] [get_bd_pins freq_corr_0/m_axis_qc_tready]
+  connect_bd_net -net xlconstant_aa_lpf_ap_start_dout [get_bd_pins aa_lpf_I/ap_start] [get_bd_pins aa_lpf_Q/ap_start] [get_bd_pins xlconstant_aa_lpf_ap_start/dout]
   connect_bd_net -net aclk_0_1 [get_bd_ports aclk_0] [get_bd_pins aa_lpf_I/ap_clk] [get_bd_pins aa_lpf_Q/ap_clk] [get_bd_pins audio_lpf_0/aclk] [get_bd_pins de_emph_0/aclk] [get_bd_pins fir_dec_0/aclk] [get_bd_pins fm_disc_0/ap_clk] [get_bd_pins freq_corr_0/aclk] [get_bd_pins nco_0/aclk]
   connect_bd_net -net aresetn_0_1 [get_bd_ports aresetn_0] [get_bd_pins aa_lpf_I/ap_rst_n] [get_bd_pins aa_lpf_Q/ap_rst_n] [get_bd_pins audio_lpf_0/aresetn] [get_bd_pins de_emph_0/aresetn] [get_bd_pins fir_dec_0/aresetn] [get_bd_pins fm_disc_0/ap_rst_n] [get_bd_pins freq_corr_0/aresetn] [get_bd_pins nco_0/aresetn]
   connect_bd_net -net freq_corr_0_m_axis_ic_tdata [get_bd_pins I_adapter/In0] [get_bd_pins freq_corr_0/m_axis_ic_tdata]

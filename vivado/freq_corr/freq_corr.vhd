@@ -17,6 +17,21 @@
 --   Cycle 1: latch inputs (requires all four input streams valid together)
 --   Cycle 2: multiply, add, resize
 --
+-- BACKPRESSURE FIX: m_axis_ic_tready / m_axis_qc_tready were declared as
+-- entity ports but never referenced in the architecture body. The pipeline
+-- advanced and overwrote ic_reg/qc_reg on every clock cycle regardless of
+-- whether aa_lpf was ready to accept, which is a direct AXI-Stream protocol
+-- violation (a master must hold tdata/tvalid stable across any cycle where
+-- tready is low).
+--
+-- Fix: out_ready gates both pipeline stages together. When out_ready='0'
+-- (downstream not ready AND output register holds unconsumed valid data),
+-- the entire pipeline freezes: stage-1 latched inputs hold, stage-2
+-- ic_reg/qc_reg/v2_reg hold, and the input-side tready goes low so the
+-- upstream NCO also stalls. This is a stall-the-whole-pipeline fix --
+-- simpler and lower risk than adding elastic buffering, at the cost of not
+-- absorbing one extra input sample while genuinely stalled.
+--
 -- Marco Aiello, 2024
 
 library ieee;
@@ -59,7 +74,13 @@ end entity freq_corr;
 architecture rtl of freq_corr is
 
     -- All four input streams must be valid together to advance the pipeline
-    signal in_valid : std_logic;
+    signal in_valid  : std_logic;
+
+    -- BACKPRESSURE FIX: true when the stage-2 output register is safe to
+    -- overwrite this cycle -- either downstream is consuming what is there
+    -- (both tready high) or there is nothing valid held there yet (v2_reg=0).
+    -- Gates both pipeline stages AND the input-side tready together.
+    signal out_ready : std_logic;
 
     -- Stage 1 registers: raw 16-bit signed inputs
     signal i_reg  : signed(15 downto 0) := (others => '0');
@@ -91,11 +112,17 @@ architecture rtl of freq_corr is
 
 begin
 
-    -- All four input streams accepted together (no independent backpressure
-    -- per stream -- they must be synchronised by the upstream producer,
-    -- matching Simulink's frame-synchronous port semantics).
+    -- BACKPRESSURE FIX: pipeline may only advance when the stage-2 output
+    -- register is either empty (nothing valid held) or being consumed this
+    -- cycle (both downstream treadys high).
+    out_ready <= (m_axis_ic_tready and m_axis_qc_tready) or (not v2_reg);
+
+    -- All four input streams accepted together. Also gated on out_ready:
+    -- if the pipeline cannot advance this cycle, input tready goes low so
+    -- the upstream NCO stalls in step with freq_corr.
     in_valid <= s_axis_i_tvalid and s_axis_q_tvalid and
-                s_axis_cos_tvalid and s_axis_sin_tvalid;
+                s_axis_cos_tvalid and s_axis_sin_tvalid and
+                out_ready;
 
     s_axis_i_tready   <= in_valid;
     s_axis_q_tready   <= in_valid;
@@ -123,36 +150,43 @@ begin
                 qc_reg <= (others => '0');
                 v2_reg <= '0';
             else
-                -- ── Stage 2: multiply-accumulate from latched inputs ──────
-                if v1_reg = '1' then
-                    ixc := i_reg * c_reg;
-                    qxs := q_reg * s_reg;
-                    ixs := i_reg * s_reg;
-                    qxc := q_reg * c_reg;
+                -- BACKPRESSURE FIX: entire pipeline wrapped in out_ready.
+                -- When out_ready='0', no signal in this branch is assigned,
+                -- so all registers implicitly hold (standard VHDL synchronous
+                -- process semantics) until downstream is ready again.
+                if out_ready = '1' then
+                    -- ── Stage 2: multiply-accumulate from latched inputs ──
+                    if v1_reg = '1' then
+                        ixc := i_reg * c_reg;
+                        qxs := q_reg * s_reg;
+                        ixs := i_reg * s_reg;
+                        qxc := q_reg * c_reg;
 
-                    -- Round each product to sfix18_En17 before summing
-                    -- (matches Simulink FreqCorr fixdt(1,18,17) products).
-                    ic_sum := resize(shift_right(resize(ixc,33) + 4096, 13), 33) -
-                              resize(shift_right(resize(qxs,33) + 4096, 13), 33);
-                    qc_sum := resize(shift_right(resize(ixs,33) + 4096, 13), 33) +
-                              resize(shift_right(resize(qxc,33) + 4096, 13), 33);
+                        -- Round each product to sfix18_En17 before summing
+                        -- (matches Simulink FreqCorr fixdt(1,18,17) products).
+                        ic_sum := resize(shift_right(resize(ixc,33) + 4096, 13), 33) -
+                                  resize(shift_right(resize(qxs,33) + 4096, 13), 33);
+                        qc_sum := resize(shift_right(resize(ixs,33) + 4096, 13), 33) +
+                                  resize(shift_right(resize(qxc,33) + 4096, 13), 33);
 
-                    ic_shr := ic_sum;
-                    qc_shr := qc_sum;
+                        ic_shr := ic_sum;
+                        qc_shr := qc_sum;
 
-                    ic_reg <= saturate18(ic_shr);
-                    qc_reg <= saturate18(qc_shr);
+                        ic_reg <= saturate18(ic_shr);
+                        qc_reg <= saturate18(qc_shr);
+                    end if;
+                    v2_reg <= v1_reg;
+
+                    -- ── Stage 1: latch inputs ─────────────────────────────
+                    if in_valid = '1' then
+                        i_reg <= signed(s_axis_i_tdata);
+                        q_reg <= signed(s_axis_q_tdata);
+                        c_reg <= signed(s_axis_cos_tdata);
+                        s_reg <= signed(s_axis_sin_tdata);
+                    end if;
+                    v1_reg <= in_valid;
                 end if;
-                v2_reg <= v1_reg;
-
-                -- ── Stage 1: latch inputs ─────────────────────────────────
-                if in_valid = '1' then
-                    i_reg <= signed(s_axis_i_tdata);
-                    q_reg <= signed(s_axis_q_tdata);
-                    c_reg <= signed(s_axis_cos_tdata);
-                    s_reg <= signed(s_axis_sin_tdata);
-                end if;
-                v1_reg <= in_valid;
+                -- else: out_ready='0' -- all registers hold, pipeline frozen.
             end if;
         end if;
     end process;

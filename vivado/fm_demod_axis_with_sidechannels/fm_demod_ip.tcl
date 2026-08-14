@@ -41,7 +41,7 @@ add_files -norecurse tlast_gen.vhd
 # sub-block's packaged IP lives, then rescan so they appear in the
 # IP Catalog and can be instantiated by name in the block design.
 set_property  ip_repo_paths  ../ [current_project]
-update_ip_catalog
+update_ip_catalog -rebuild
 
 # Add source files needed in the block design
 add_files -norecurse {./tlast_gen.vhd ./iq_splitter.vhd}

@@ -79,6 +79,8 @@ set_property CONFIG.DSP48_Use                   {Minimal}    [get_ips dds_compil
 set_property CONFIG.Has_Phase_Out  {false}        [get_ips dds_compiler_0]
 set_property CONFIG.Has_ARESETn    {true}         [get_ips dds_compiler_0]
 set_property CONFIG.DATA_Has_TLAST {Not_Required} [get_ips dds_compiler_0]
+# BACKPRESSURE FIX: companion to nco_wrapper.vhd tready ports
+set_property CONFIG.Has_TREADY {true} [get_ips dds_compiler_0]
 
 # Step 5: latency
 set_property CONFIG.Latency_Configuration {Configurable} [get_ips dds_compiler_0]

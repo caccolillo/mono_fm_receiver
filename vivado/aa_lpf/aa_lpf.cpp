@@ -21,6 +21,28 @@
  * sample -- comfortably inside the 400-cycle budget at 100 MHz clock vs.
  * 250 kHz sample rate, while using only a handful of DSP48 slices.
  *
+ * CONTROL PROTOCOL FIX: this block was previously ap_ctrl_none. That is
+ * wrong for this design and causes a confirmed, severe data-loss bug --
+ * 5000 input samples fed back-to-back produce only ~21 output samples.
+ * Root cause: aa_lpf carries persistent internal state (shift_reg, static,
+ * below) and takes ~129 cycles to fully process one sample through
+ * SHIFT_Loop + MAC_Loop. ap_ctrl_none generates NO ap_start/ap_idle/
+ * ap_ready handshake, so nothing gates s_axis_x's tready to reflect that
+ * the core is still mid-computation -- it kept accepting a new x sample
+ * almost every cycle, overwriting shift_reg/acc before the previous sample
+ * had finished propagating through.
+ *
+ * Fix: remove ap_ctrl_none so HLS defaults to ap_ctrl_hs. Tie ap_start
+ * permanently high via an xlconstant in fm_demod/bd.tcl (same pattern
+ * already used for audio_ppdma_0/iq_ppdma_0). With ap_start tied high the
+ * block restarts itself the instant it goes idle, genuinely gating each new
+ * x sample behind the previous invocation's completion.
+ *
+ * REQUIRED companion fix: the #pragma HLS RESET on shift_reg below.
+ * Vitis HLS's default reset scope covers only the ap_ctrl_hs control FSM,
+ * NOT data-path static variables. shift_reg is exactly that class of static
+ * data-path state and needs an explicit reset pragma.
+ *
  * @param x : Incoming data sample, fixdt(1,18,17) format. AXI-S slave.
  * @param y : Filtered output sample, fixdt(1,18,17) with saturation. AXI-S master.
  */
@@ -28,10 +50,12 @@ void aa_lpf(data_t &x, data_t &y) {
 
     #pragma HLS INTERFACE mode=axis port=x
     #pragma HLS INTERFACE mode=axis port=y
-    #pragma HLS INTERFACE mode=ap_ctrl_none port=return
+    // No ap_ctrl_none -- default ap_ctrl_hs. ap_start tied permanently high
+    // in fm_demod/bd.tcl via xlconstant_aa_lpf_ap_start.
 
     // Single-channel tapped delay line
     static data_t shift_reg[NTAPS] = {0};
+    #pragma HLS RESET variable=shift_reg
 
     // Shift the delay line and insert the new sample first.
     SHIFT_Loop:
