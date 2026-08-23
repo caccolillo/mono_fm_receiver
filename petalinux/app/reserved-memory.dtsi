@@ -19,10 +19,49 @@
  * PetaLinux merges any system-user.dtsi found in
  * project-spec/meta-user/recipes-bsp/device-tree/files/ into the final
  * device tree automatically -- no manual dtc invocation needed.
+ *
+ * SD BOOT FIX (CORRECTED): previously guessed &sdhci1 based on inferring
+ * from a PetaLinux config log line (psu_sd_1 selected) -- WRONG. The
+ * actual, proven, working device-tree block for this exact fix, pulled
+ * directly from a known-working sibling Ultra96-V2 project's own
+ * system-user.dtsi, uses &sdhci0 with two additional properties this
+ * file was missing entirely (disable-wp, xlnx,mio-bank). The physical
+ * microSD socket wiring is a fixed hardware trait of the Ultra96-V2
+ * board itself -- identical between any two projects targeting this
+ * exact board -- so there was no reason to guess differently here in
+ * the first place; this should have been copied verbatim from the start
+ * instead of reconstructed.
+ *
+ * Per AMD/Xilinx's own documentation, UHS support is board/silicon-
+ * dependent and "not all boards are having 3.0 level shifter" -- the
+ * Ultra96-V2 is one of the boards without it, hard-wiring the microSD
+ * I/O bank to 1.8V with no regulator to actually switch to. Without
+ * no-1-8-v, the controller tries a 3.3V-then-switch-to-1.8V negotiation
+ * that can never complete, producing exactly this failure signature:
+ *   unable to select a mode
+ *   device_remove: Device 'mmc@...blk' failed to remove...
+ *   "Synchronous Abort" handler...
+ *   ### ERROR ### Please RESET the board ###
  */
 
 /include/ "system-conf.dtsi"
 / {
+    chosen {
+        /* Hard override, matching the reference project's own pattern,
+         * rather than relying solely on PetaLinux's Kconfig-generated
+         * bootargs -- ttyPS1 because this project's own PetaLinux
+         * config selected psu_uart_1 as the primary UART (confirmed
+         * from the earlier --get-hw-description silentconfig log),
+         * same as the reference project -- this file previously left
+         * bootargs to Kconfig generation, which produced ttyPS0
+         * instead. root=/dev/mmcblk0p2 matches this project's ext4
+         * rootfs partition (see build_petalinux.sh's pre-seeded
+         * CONFIG_SUBSYSTEM_SDROOT_DEV).
+         */
+        bootargs = "earlycon console=ttyPS1,115200 root=/dev/mmcblk0p2 rw rootwait";
+        stdout-path = "serial1:115200n8";
+    };
+
     reserved-memory {
         #address-cells = <1>;
         #size-cells = <1>;
@@ -53,4 +92,13 @@
             reg = <0x3e400000 0x00100000>; /* 1 MB */
         };
     };
+};
+
+/* Actual proven block, copied directly from a known-working sibling
+ * Ultra96-V2 project's own system-user.dtsi -- see the SD BOOT FIX
+ * note above for why the previous &sdhci1-based guess was wrong. */
+&sdhci0 {
+    no-1-8-v;
+    disable-wp;
+    xlnx,mio-bank = <0>;
 };

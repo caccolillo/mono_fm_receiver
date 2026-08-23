@@ -52,18 +52,18 @@
  * from this side -- worth confirming with a simple read-back test
  * during bring-up before trusting long unattended runs.
  * ----------------------------------------------------------------------
- * GPIO CHIP/LINE NUMBERING (unverified assumption):
+ * GPIO CHIP/LINE NUMBERING (CONFIRMED on real hardware, previously an
+ * unverified assumption -- see the fix note by GPIOCHIP_LABEL below):
  *
  * axi_gpio_0's two 1-bit channels (iq_ppdma_0/active_buf on channel 1,
- * audio_ppdma_0/active_buf on channel 2) will appear as GPIO lines on
- * whatever gpiochip Linux's gpio-xilinx driver registers for this
- * instance. This file assumes ONE gpiochip with line 0 = channel 1,
- * line 1 = channel 2 -- a reasonable default guess, but exact
- * numbering depends on kernel probe order and the generated device
- * tree, not something derivable from bd.tcl alone. CONFIRM with
- * `gpiodetect` and `gpioinfo` on the actual running target before
- * trusting GPIOCHIP_NAME/IQ_ACTIVE_LINE/AUDIO_ACTIVE_LINE below, and
- * adjust if they don't match.
+ * audio_ppdma_0/active_buf on channel 2) appear as GPIO lines 0 and 1
+ * on the gpiochip labelled "a0000000.gpio" -- confirmed directly via
+ * `cat /sys/kernel/debug/gpio` on the running target. Originally opened
+ * by numbered name ("gpiochip0"), which assumed a specific enumeration
+ * order that turned out to be wrong on real hardware (gpiochip0 was
+ * actually the PS's own firmware GPIO controller, not this one) --
+ * fixed to open by LABEL instead, which is deterministic regardless of
+ * whatever number the kernel happens to assign on any given boot.
  * ----------------------------------------------------------------------
  */
 
@@ -89,12 +89,38 @@
 #define AUDIO_DEST_ADDR           0x3E400000u
 #define IQ_BUF_SIZE_WORDS         2500u
 #define AUDIO_SAMPLES_PER_BUFFER  50u
+
+/* ITU-R max FM deviation -- matches main.c's own FM_MAX_DEV_HZ exactly.
+ * See the fix note by drain_audio_block's conversion code below: this
+ * constant was entirely missing from this file, causing severe PCM16
+ * clipping (confirmed on real hardware: 77.4% of samples pinned at the
+ * saturation rails). */
+#define FM_MAX_DEV_HZ             75000.0f
 #define MMAP_REGION_SIZE          0x100000u   /* 1 MB per region, matches dtsi */
 
 #define AUDIO_EOF_GRACE_BLOCKS    20u
 
-/* GPIO chip/line -- see GPIO CHIP/LINE NUMBERING note above. */
-#define GPIOCHIP_NAME             "gpiochip0"
+/* GPIO chip/line -- see GPIO CHIP/LINE NUMBERING note above.
+ *
+ * FIX (confirmed on real hardware): originally opened by NUMBERED name
+ * ("gpiochip0"), which assumes a specific chip enumeration order.
+ * GPIO chip numbering is NOT guaranteed stable across boots -- it
+ * depends on kernel driver probe order, which can shift after a kernel
+ * config change or even just probe timing variance. Confirmed directly:
+ * on this board, gpiochip0 turned out to be the ZynqMP PS's own
+ * firmware GPIO controller (508-511), not our axi_gpio_0 core, which
+ * enumerated as gpiochip1 (506-507) instead -- opposite of what
+ * "gpiochip0" assumed. Requesting line 1 on the wrong chip collided
+ * with gpio-509 ("reset", already claimed by the PS firmware), giving
+ * a genuine, deterministic EBUSY on every run -- not a real conflict
+ * with anything of ours, just the wrong chip.
+ *
+ * Opening by LABEL instead is deterministic regardless of enumeration
+ * order -- "a0000000.gpio" is tied to axi_gpio_0's actual hardware
+ * address (confirmed via /sys/kernel/debug/gpio's own "parent:
+ * platform/a0000000.gpio" line), not to whatever number the kernel
+ * happens to assign it on any given boot. */
+#define GPIOCHIP_LABEL            "a0000000.gpio"
 #define IQ_ACTIVE_LINE            0
 #define AUDIO_ACTIVE_LINE         1
 
@@ -208,14 +234,16 @@ static struct gpiod_line *g_audio_line;
 
 static int gpio_init(void)
 {
-    g_chip = gpiod_chip_open_by_name(GPIOCHIP_NAME);
+    g_chip = gpiod_chip_open_by_label(GPIOCHIP_LABEL);
     if (!g_chip) {
-        fprintf(stderr, "gpiod_chip_open_by_name(%s) failed: %s\n",
-                GPIOCHIP_NAME, strerror(errno));
-        fprintf(stderr, "Run `gpiodetect` and `gpioinfo` on target to find "
-                "the correct chip name and line offsets for axi_gpio_0, "
-                "then update GPIOCHIP_NAME/IQ_ACTIVE_LINE/AUDIO_ACTIVE_LINE "
-                "at the top of this file.\n");
+        fprintf(stderr, "gpiod_chip_open_by_label(%s) failed: %s\n",
+                GPIOCHIP_LABEL, strerror(errno));
+        fprintf(stderr, "Run `cat /sys/kernel/debug/gpio` on target to "
+                "confirm axi_gpio_0's actual label (look for the "
+                "\"parent: platform/...\" line) and line numbers, "
+                "then update GPIOCHIP_LABEL/IQ_ACTIVE_LINE/"
+                "AUDIO_ACTIVE_LINE at the top of this file if it's "
+                "genuinely different on your board.\n");
         return -1;
     }
 
@@ -274,7 +302,16 @@ static void refill_iq_buffer(FILE *fin, volatile uint32_t *dest, int *eof_hit)
         if (i < pairs_read) {
             int16_t I = iq_stage[2 * i];
             int16_t Q = iq_stage[2 * i + 1];
-            iq_packed[i] = ((uint32_t)(uint16_t)I << 16) | (uint32_t)(uint16_t)Q;
+            /* SWAPPED from (I<<16)|Q, matching the same swap tried on
+             * main.c earlier -- but that test was inconclusive there,
+             * since it happened while a separate clipping bug was
+             * still masking real content either way. This is the first
+             * fair test of I/Q order on genuinely clean (non-clipping,
+             * well-captured) audio: reported "recognizable voice/music
+             * but highly distorted" with clipping and capture rate both
+             * independently confirmed fine, leaving packing order as
+             * the most likely remaining explanation. */
+            iq_packed[i] = ((uint32_t)(uint16_t)Q << 16) | (uint32_t)(uint16_t)I;
         } else {
             iq_packed[i] = 0;
         }
@@ -289,11 +326,21 @@ static int drain_audio_block(volatile uint32_t *src, FILE *fout,
     for (uint32_t i = 0; i < AUDIO_SAMPLES_PER_BUFFER; i++) {
         int32_t raw = (int32_t)src[i];
 
-        /* sfix32_En13 -> real value, ASSUMED +-1.0 full scale -- same
-         * flagged assumption as the bare-metal version; verify against
-         * verify_fm_demod_rtl.m if audio is clipped or too quiet. */
-        float val    = (float)raw / 8192.0f;
-        float scaled = val * 32767.0f;
+        /* sfix32_En13 -> Hz -> normalised [-1,+1] -> PCM16.
+         *
+         * BUG FOUND (confirmed on real hardware): this file's own
+         * comment already flagged this exact assumption as unverified
+         * ("same flagged assumption as the bare-metal version") -- and
+         * it turned out to be wrong here too, independently of main.c,
+         * since this is a separate implementation that never received
+         * the same fix. Missing the /FM_MAX_DEV_HZ normalisation meant
+         * a legitimate ~15000 Hz audio value produced 15000*32767 =
+         * ~491 million before clamping -- hard-saturated to the PCM16
+         * rails on nearly every sample. Measured directly: 77.4% of all
+         * samples in a real recording pinned at -32768/+32767. */
+        float val_hz   = (float)raw / 8192.0f;
+        float val_norm = val_hz / FM_MAX_DEV_HZ;
+        float scaled   = val_norm * 32767.0f;
         if (scaled > 32767.0f)  scaled = 32767.0f;
         if (scaled < -32768.0f) scaled = -32768.0f;
         audio_pcm_block[i] = (int16_t)lroundf(scaled);

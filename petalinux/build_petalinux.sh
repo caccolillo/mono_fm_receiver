@@ -175,59 +175,32 @@ fi
 
 # ---- SECOND, MORE FUNDAMENTAL FIX ----
 #
-# CONFIRMED BUG (found via a known-working sibling Ultra96-V2 project's
-# own build script): this project's project-spec/configs/config was
+# ORDERING CORRECTED (found by reading the sibling project's build
+# script completely start-to-finish, not in fragments): that script
+# does hw-description import as a PLAIN, unmodified silentconfig call
+# first, and only writes/applies config overrides (MACHINE_NAME, ext4
+# rootfs, bootargs) in a SEPARATE, SUBSEQUENT petalinux-config call
+# afterward. This script previously pre-seeded MACHINE_NAME and the
+# ext4 rootfs settings BEFORE the first --get-hw-description call --
+# structurally risky, since importing a hardware description is
+# exactly the kind of operation that could regenerate machine-specific
+# device tree defaults from scratch, potentially clobbering values
+# already on file even though a later grep-check would still show them
+# "present" (because this script re-adds them afterward regardless,
+# without confirming the actual device tree generation ran against the
+# correct value at the right time). UBOOT_DEVICETREE_OFFSET stays
+# pre-seeded before the first call -- confirmed necessary and unrelated
+# to this specific ordering question, already proven to get cleanly
+# past this step as-is.
+#
+# CONFIRMED BUG this MACHINE_NAME fix addresses (found via the same
+# sibling project): this project's project-spec/configs/config was
 # generated with CONFIG_SUBSYSTEM_MACHINE_NAME="template" -- literally
 # the generic Kconfig placeholder value, never actually set to the real
 # board. Per the sibling project's own comment on the equivalent line:
 #   "tells DTG to use the Ultra96-V2 board device tree. Without this
 #    PetaLinux generates a generic DTS that lacks the SD 1.8V signalling
 #    config -- the board hangs reading the SD card after FSBL."
-# This is very likely the actual foundational cause of "all LEDs stuck,
-# nothing on UART at all" -- more fundamental than the SD partition-type
-# fix or the no-1-8-v dtsi override, both of which are still correct and
-# still needed, but sit on top of a device tree that was never actually
-# board-specific to begin with.
-if ! grep -q "^CONFIG_SUBSYSTEM_MACHINE_NAME=" "${CONFIG_FILE}" 2>/dev/null; then
-    echo 'CONFIG_SUBSYSTEM_MACHINE_NAME="avnet-ultra96-rev1"' >> "${CONFIG_FILE}"
-    info "Pre-seeded SUBSYSTEM_MACHINE_NAME=avnet-ultra96-rev1 (was silently"
-    info "defaulting to the generic 'template' placeholder -- this is what"
-    info "actually tells PetaLinux's device tree generator to use the real"
-    info "Ultra96-V2 board device tree instead of a generic ZynqMP one)"
-else
-    warn "CONFIG_SUBSYSTEM_MACHINE_NAME already set in ${CONFIG_FILE} --"
-    warn "not overriding. Check it's not still \"template\":"
-    warn "  grep MACHINE_NAME ${CONFIG_FILE}"
-fi
-
-# ---- ARCHITECTURE SWITCH: initramfs -> ext4 two-partition rootfs ----
-#
-# Switching from CONFIG_SUBSYSTEM_ROOTFS_INITRD (rootfs embedded in
-# image.ub) to CONFIG_SUBSYSTEM_ROOTFS_EXT4 (separate ext4 partition),
-# matching a known-working sibling Ultra96-V2 project's proven boot
-# architecture exactly, rather than continuing to debug an unproven one.
-# Direct evidence this project's initramfs path was never actually
-# confirmed working end-to-end: after flashing with the previous
-# single-partition create_sd.sh, only ONE partition (boot) ever showed
-# up when the card was reinserted into a PC -- expected for that layout,
-# but the sibling project's own flash script produces two visible
-# partitions (boot + rootfs) on a card that's confirmed to actually
-# boot. Matching that architecture directly, rather than patching the
-# unproven one fix at a time.
-if ! grep -q "^CONFIG_SUBSYSTEM_ROOTFS_EXT4=y" "${CONFIG_FILE}" 2>/dev/null; then
-    cat >> "${CONFIG_FILE}" << 'ROOTFSCFG'
-CONFIG_SUBSYSTEM_ROOTFS_EXT4=y
-CONFIG_SUBSYSTEM_SDROOT_DEV="/dev/mmcblk0p2"
-CONFIG_SUBSYSTEM_RFS_FORMATS="ext4 ext4.gz"
-CONFIG_SUBSYSTEM_BOOTARGS_AUTO=n
-CONFIG_SUBSYSTEM_BOOTARGS="earlycon console=ttyPS0,115200 root=/dev/mmcblk0p2 rw rootwait"
-ROOTFSCFG
-    info "Pre-seeded ext4 two-partition rootfs config (was initramfs/"
-    info "CONFIG_SUBSYSTEM_ROOTFS_INITRD, embedded in image.ub -- never"
-    info "confirmed working end-to-end on this project). Produces a"
-    info "separate rootfs.ext4 image file for create_sd.sh to dd onto a"
-    info "second partition, matching the sibling project's proven layout."
-fi
 
 # ---- 3. Import the hardware description (device tree, PS config) ----
 step "3/7  Importing hardware description"
@@ -237,6 +210,42 @@ info "print to appear live rather than sitting buffered."
 stdbuf -oL -eL petalinux-config --get-hw-description="${XSA_ABS}" \
                   --silentconfig 2>&1 | tee -a "${LOG_FILE}"
 info "Hardware description imported"
+
+# ---- Apply overrides AFTER hw-description import, matching the sibling
+# project's proven two-phase order, then re-run silentconfig to
+# actually apply them (their own Step 4 does exactly this second pass).
+if ! grep -q "^CONFIG_SUBSYSTEM_MACHINE_NAME=\"avnet-ultra96-rev1\"" "${CONFIG_FILE}" 2>/dev/null; then
+    # Remove any existing (wrong/template) value first so this doesn't
+    # end up with two conflicting MACHINE_NAME lines in the same file.
+    sed -i '/^CONFIG_SUBSYSTEM_MACHINE_NAME=/d' "${CONFIG_FILE}" 2>/dev/null || true
+    echo 'CONFIG_SUBSYSTEM_MACHINE_NAME="avnet-ultra96-rev1"' >> "${CONFIG_FILE}"
+    info "Set SUBSYSTEM_MACHINE_NAME=avnet-ultra96-rev1 (was silently"
+    info "defaulting to the generic 'template' placeholder -- this is what"
+    info "actually tells PetaLinux's device tree generator to use the real"
+    info "Ultra96-V2 board device tree instead of a generic ZynqMP one)"
+fi
+
+if ! grep -q "^CONFIG_SUBSYSTEM_ROOTFS_EXT4=y" "${CONFIG_FILE}" 2>/dev/null; then
+    cat >> "${CONFIG_FILE}" << 'ROOTFSCFG'
+CONFIG_SUBSYSTEM_ROOTFS_EXT4=y
+CONFIG_SUBSYSTEM_SDROOT_DEV="/dev/mmcblk0p2"
+CONFIG_SUBSYSTEM_RFS_FORMATS="ext4 ext4.gz"
+CONFIG_SUBSYSTEM_BOOTARGS_AUTO=n
+CONFIG_SUBSYSTEM_BOOTARGS="earlycon console=ttyPS1,115200 root=/dev/mmcblk0p2 rw rootwait"
+ROOTFSCFG
+    info "Set ext4 two-partition rootfs config (was initramfs/"
+    info "CONFIG_SUBSYSTEM_ROOTFS_INITRD, embedded in image.ub -- never"
+    info "confirmed working end-to-end on this project). Also corrected"
+    info "console=ttyPS0 to ttyPS1 here for consistency with the dtsi's"
+    info "own chosen-node override (this project's PetaLinux config"
+    info "selected psu_uart_1 as the primary UART, same as the sibling"
+    info "project) -- the dtsi's override should take precedence either"
+    info "way, but no reason to leave the two inconsistent."
+fi
+
+info "Re-running silentconfig to apply the overrides just written"
+stdbuf -oL -eL petalinux-config --silentconfig 2>&1 | tee -a "${LOG_FILE}"
+info "Overrides applied"
 
 # ---- 4. Reserved-memory device-tree overlay for the ppdma DDR buffers
 #
@@ -281,9 +290,17 @@ do
         info "Enabled package: ${pkg}"
     fi
 done
-info "Running rootfs config (quiet for a bit, same reason as step 3)"
-stdbuf -oL -eL petalinux-config -c rootfs --silentconfig 2>&1 | tee -a "${LOG_FILE}"
-info "Rootfs config complete"
+# DELIBERATELY no `petalinux-config -c rootfs --silentconfig` call here.
+# Per the sibling project's own explicit comment on this exact step:
+#   "This avoids running silentconfig rootfs with a fragment (which
+#    fails if the recipes haven't been fully registered yet)."
+# Editing rootfs_config directly, the same file that silentconfig would
+# have written to anyway, and leaving it there is what their proven
+# script does -- petalinux-build itself picks up rootfs_config as-is
+# without needing a separate config pass over it first.
+info "rootfs_config updated directly (no silentconfig re-run -- matches"
+info "the sibling project's own explicit avoidance of a known failure"
+info "trigger on this specific step)"
 
 # ---- 5. Scaffold the userspace app, then overwrite with our source ---
 step "5/7  Creating fmdemod-linux app recipe"
@@ -351,6 +368,21 @@ if [ -f "${APP_BB}" ]; then
         echo 'SRC_URI += "file://resample_50k_to_48k.c file://resample_coeffs.h"' >> "${APP_BB}"
         info "Added companion sources to app recipe SRC_URI"
     fi
+fi
+
+# Explicit dual registration, matching the reference project's own
+# belt-and-suspenders approach rather than trusting --enable (above)
+# alone to have actually registered the app correctly.
+USER_ROOTFS_CFG="project-spec/meta-user/conf/user-rootfsconfig"
+mkdir -p "$(dirname "${USER_ROOTFS_CFG}")"
+touch "${USER_ROOTFS_CFG}"
+if ! grep -q "CONFIG_${APP_NAME}" "${USER_ROOTFS_CFG}" 2>/dev/null; then
+    echo "CONFIG_${APP_NAME}=y" >> "${USER_ROOTFS_CFG}"
+    info "Registered ${APP_NAME} in user-rootfsconfig"
+fi
+if ! grep -q "CONFIG_${APP_NAME}=y" "${ROOTFS_CONFIG}" 2>/dev/null; then
+    echo "CONFIG_${APP_NAME}=y" >> "${ROOTFS_CONFIG}"
+    info "Registered ${APP_NAME} in rootfs_config"
 fi
 
 # ---- 6. Build --------------------------------------------------------
