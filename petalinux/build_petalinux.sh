@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # build_petalinux.sh - Scaffold and build a PetaLinux project for the
-# sdr_fm_receiver design (Ultra96-V2, xczu3eg-sbva484-1-i), including the
+# sdr_fm_receiver design (Zybo Z7-10, xc7z010clg400-1), including the
 # fmdemod-linux userspace C app.
 #
 # TARGETS PetaLinux 2022.2 CLI conventions (matching the Vivado/Vitis
@@ -130,7 +130,7 @@ if [ ! -d "${PROJECT_NAME}" ]; then
     # pre-seeding that one symbol's value didn't help, because the real
     # problem was the two halves of the config disagreeing about which
     # CPU exists in the first place, not that one symbol specifically.
-    petalinux-create -t project --template zynqMP -n "${PROJECT_NAME}"
+    petalinux-create -t project --template zynq -n "${PROJECT_NAME}"
     info "Project created: ${SCRIPT_DIR}/${PROJECT_NAME}"
 else
     warn "Project ${PROJECT_NAME} already exists, reusing it"
@@ -188,17 +188,20 @@ fi
 # fix or the no-1-8-v dtsi override, both of which are still correct and
 # still needed, but sit on top of a device tree that was never actually
 # board-specific to begin with.
-if ! grep -q "^CONFIG_SUBSYSTEM_MACHINE_NAME=" "${CONFIG_FILE}" 2>/dev/null; then
-    echo 'CONFIG_SUBSYSTEM_MACHINE_NAME="avnet-ultra96-rev1"' >> "${CONFIG_FILE}"
-    info "Pre-seeded SUBSYSTEM_MACHINE_NAME=avnet-ultra96-rev1 (was silently"
-    info "defaulting to the generic 'template' placeholder -- this is what"
-    info "actually tells PetaLinux's device tree generator to use the real"
-    info "Ultra96-V2 board device tree instead of a generic ZynqMP one)"
-else
-    warn "CONFIG_SUBSYSTEM_MACHINE_NAME already set in ${CONFIG_FILE} --"
-    warn "not overriding. Check it's not still \"template\":"
-    warn "  grep MACHINE_NAME ${CONFIG_FILE}"
-fi
+# ZYBO Z7-10 NOTE: the Ultra96 reasoning above does NOT apply here.
+# That failure was caused by missing SD 1.8V (UHS-I) signalling config,
+# which is a ZynqMP concern -- Zynq-7000's SDIO controller has no 1.8V
+# signalling mode at all. There is also no Zybo BSP installed in this
+# PetaLinux (checked: no zybo machine conf under meta-xilinx-bsp), so
+# setting a board machine name would fail at device-tree generation.
+#
+# For a custom block design the correct approach is to leave the machine
+# name at the generic template and let DTG derive the device tree from
+# the XSA. The reserved-memory overlay in app/reserved-memory.dtsi
+# supplies the only board-specific binding this application depends on.
+info "Leaving CONFIG_SUBSYSTEM_MACHINE_NAME at default -- DTG will derive"
+info "the device tree from the XSA (no Zybo BSP installed, and none needed"
+info "for this design)."
 
 # ---- ARCHITECTURE SWITCH: initramfs -> ext4 two-partition rootfs ----
 #
@@ -220,7 +223,7 @@ CONFIG_SUBSYSTEM_ROOTFS_EXT4=y
 CONFIG_SUBSYSTEM_SDROOT_DEV="/dev/mmcblk0p2"
 CONFIG_SUBSYSTEM_RFS_FORMATS="ext4 ext4.gz"
 CONFIG_SUBSYSTEM_BOOTARGS_AUTO=n
-CONFIG_SUBSYSTEM_BOOTARGS="earlycon console=ttyPS0,115200 root=/dev/mmcblk0p2 rw rootwait"
+CONFIG_SUBSYSTEM_USER_CMDLINE="earlycon console=ttyPS0,115200 root=/dev/mmcblk0p2 rw rootwait"
 ROOTFSCFG
     info "Pre-seeded ext4 two-partition rootfs config (was initramfs/"
     info "CONFIG_SUBSYSTEM_ROOTFS_INITRD, embedded in image.ub -- never"
@@ -241,7 +244,7 @@ info "Hardware description imported"
 # ---- 4. Reserved-memory device-tree overlay for the ppdma DDR buffers
 #
 # The audio_ppdma_0/iq_ppdma_0 ping/pong/dest buffers live at fixed
-# physical addresses (0x3E000000-0x3E4FFFFF, matching the xlconstant
+# physical addresses (0x10000000-0x104FFFFF, matching the xlconstant
 # values in bd.tcl) that userspace accesses directly via /dev/mem.
 # Without this reserved-memory/no-map node, the kernel's own memory
 # allocator is free to also hand out pages in this range to unrelated
@@ -392,16 +395,15 @@ step "7/7  Packaging BOOT.BIN"
 # script). TODO: still worth confirming these exact filenames against
 # your actual build output once it completes -- exact names can vary by
 # project layout/PetaLinux version even within the same SoC family.
-for f in zynqmp_fsbl.elf system.bit u-boot.elf pmufw.elf; do
+for f in zynq_fsbl.elf system.bit u-boot.elf; do
     if [ ! -f "images/linux/${f}" ]; then
         error "Missing build artifact: images/linux/${f}"
     fi
 done
 petalinux-package --boot \
-    --fsbl images/linux/zynqmp_fsbl.elf \
+    --fsbl images/linux/zynq_fsbl.elf \
     --fpga images/linux/system.bit \
     --u-boot images/linux/u-boot.elf \
-    --pmufw images/linux/pmufw.elf \
     --force 2>&1 | tee -a "${LOG_FILE}"
 
 info "Done."

@@ -61,8 +61,11 @@
  * line 1 = channel 2 -- a reasonable default guess, but exact
  * numbering depends on kernel probe order and the generated device
  * tree, not something derivable from bd.tcl alone. CONFIRM with
- * `gpiodetect` and `gpioinfo` on the actual running target before
- * trusting GPIOCHIP_NAME/IQ_ACTIVE_LINE/AUDIO_ACTIVE_LINE below, and
+ * VERIFIED on Zybo Z7-10 hardware: /sys/bus/gpio/devices shows
+ * gpiochip0 -> amba_pl/40000000.gpio (the AXI GPIO, ngpio=2) and
+ * gpiochip1 -> axi/e000a000.gpio (zynq_gpio PS MIO, ngpio=118). The PL
+ * controller enumerates FIRST here, so gpiochip0 below is correct.
+ * Note this ordering is probe-dependent and could change; re-check with
  * adjust if they don't match.
  * ----------------------------------------------------------------------
  */
@@ -84,9 +87,9 @@
  * values, and MUST be covered by the reserved-memory/no-map nodes in
  * system-user.dtsi (delivered alongside this file). */
 /* ------------------------------------------------------------------ */
-#define IQ_PING_ADDR              0x3E000000u
-#define IQ_PONG_ADDR              0x3E100000u
-#define AUDIO_DEST_ADDR           0x3E400000u
+#define IQ_PING_ADDR              0x1F000000u
+#define IQ_PONG_ADDR              0x1F100000u
+#define AUDIO_DEST_ADDR           0x1F400000u
 #define IQ_BUF_SIZE_WORDS         2500u
 #define AUDIO_SAMPLES_PER_BUFFER  50u
 #define MMAP_REGION_SIZE          0x100000u   /* 1 MB per region, matches dtsi */
@@ -283,20 +286,61 @@ static void refill_iq_buffer(FILE *fin, volatile uint32_t *dest, int *eof_hit)
     memcpy((void *)dest, iq_packed, sizeof(iq_packed));
 }
 
+/* SCALING FIX -- the previous version railed ~68% of output samples at
+ * +-32767 and showed a large apparent DC offset (asymmetric clipping of
+ * an already-offset signal).
+ *
+ * The value audio_ppdma_0 writes to DDR is sfix32_En13 representing
+ * INSTANTANEOUS FREQUENCY DEVIATION IN HZ -- it is NOT a normalised
+ * [-1,+1] amplitude signal. The old code assumed +-1.0 full scale:
+ *
+ *     val    = raw / 8192.0f;    (correct so far: -> deviation in Hz)
+ *     scaled = val * 32767.0f;   (WRONG: treats Hz as if amplitude)
+ *
+ * which is a net raw*4, i.e. roughly 75000x too much gain.
+ *
+ * Correct conversion (matches the equivalent block in vitis main.c,
+ * where this fix was already made and never ported here):
+ *     sfix32_En13 / 8192  -> deviation in Hz. Broadcast FM peaks at
+ *                            ~+-75 kHz; after de-emphasis and the audio
+ *                            LPF, content sits around +-15 kHz.
+ *     / FM_MAX_DEV_HZ     -> normalised [-1,+1]
+ *     * 32767             -> PCM16
+ *
+ * Done as one combined 64-bit integer scale-and-round rather than in
+ * float: raw*32767 can exceed 32 bits, and the float divide plus the
+ * lroundf() library call were real per-sample cost sitting inside a
+ * thin buffer-swap margin (the fabric is free-running with no flow
+ * control on this interface). Manual round-to-nearest adds half the
+ * divisor before dividing, with sign handled so negatives round
+ * correctly. Clipping logic unchanged.
+ *
+ * MUST STAY CONSISTENT with the equivalent block in vitis main.c --
+ * both produce the same WAV from the same DDR data.
+ */
+#define FM_MAX_DEV_HZ  75000L   /* ITU-R max FM deviation */
+#define PCM_SCALE_NUM  32767LL
+#define PCM_SCALE_DEN  ((int64_t)8192 * (int64_t)FM_MAX_DEV_HZ)  /* 614400000 */
+
 static int drain_audio_block(volatile uint32_t *src, FILE *fout,
                               uint32_t *total_audio_bytes)
 {
     for (uint32_t i = 0; i < AUDIO_SAMPLES_PER_BUFFER; i++) {
         int32_t raw = (int32_t)src[i];
+        int64_t num = (int64_t)raw * PCM_SCALE_NUM;
+        int64_t scaled;
 
-        /* sfix32_En13 -> real value, ASSUMED +-1.0 full scale -- same
-         * flagged assumption as the bare-metal version; verify against
-         * verify_fm_demod_rtl.m if audio is clipped or too quiet. */
-        float val    = (float)raw / 8192.0f;
-        float scaled = val * 32767.0f;
-        if (scaled > 32767.0f)  scaled = 32767.0f;
-        if (scaled < -32768.0f) scaled = -32768.0f;
-        audio_pcm_block[i] = (int16_t)lroundf(scaled);
+        if (num >= 0) {
+            scaled = (num + PCM_SCALE_DEN / 2) / PCM_SCALE_DEN;
+        } else {
+            int64_t neg_num = -num;
+            scaled = -((neg_num + PCM_SCALE_DEN / 2) / PCM_SCALE_DEN);
+        }
+
+        if (scaled >  32767) scaled =  32767;
+        if (scaled < -32768) scaled = -32768;
+
+        audio_pcm_block[i] = (int16_t)scaled;
     }
 
     size_t written = fwrite(audio_pcm_block, 1, sizeof(audio_pcm_block), fout);

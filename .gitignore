@@ -6,6 +6,7 @@
 *.mat
 *.png
 *.rpt
+*.xsa
 *proj*
 *prj*
 *.slxc
@@ -18,3 +19,6 @@
 *_sim*
 *vivado*
 *vitis*
+fm_demod_axis_ip/
+fm_demod_ip/
+petalinux/sdr_fm_receiver_linux/

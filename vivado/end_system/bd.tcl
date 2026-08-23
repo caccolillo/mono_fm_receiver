@@ -587,7 +587,7 @@ proc create_root_design { parentCell } {
   # Create instance: xlconstant_1, and set properties
   set xlconstant_1 [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 xlconstant_1 ]
   set_property -dict [list \
-    CONFIG.CONST_VAL {0x3E000000} \
+    CONFIG.CONST_VAL {0x1F000000} \
     CONFIG.CONST_WIDTH {32} \
   ] $xlconstant_1
 
@@ -595,7 +595,7 @@ proc create_root_design { parentCell } {
   # Create instance: xlconstant_2, and set properties
   set xlconstant_2 [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 xlconstant_2 ]
   set_property -dict [list \
-    CONFIG.CONST_VAL {0x3E100000} \
+    CONFIG.CONST_VAL {0x1F100000} \
     CONFIG.CONST_WIDTH {32} \
   ] $xlconstant_2
 
@@ -603,7 +603,7 @@ proc create_root_design { parentCell } {
   # Create instance: xlconstant_3, and set properties
   set xlconstant_3 [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 xlconstant_3 ]
   set_property -dict [list \
-    CONFIG.CONST_VAL {0x3E200000} \
+    CONFIG.CONST_VAL {0x1F200000} \
     CONFIG.CONST_WIDTH {32} \
   ] $xlconstant_3
 
@@ -611,7 +611,7 @@ proc create_root_design { parentCell } {
   # Create instance: xlconstant_4, and set properties
   set xlconstant_4 [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 xlconstant_4 ]
   set_property -dict [list \
-    CONFIG.CONST_VAL {0x3E300000} \
+    CONFIG.CONST_VAL {0x1F300000} \
     CONFIG.CONST_WIDTH {32} \
   ] $xlconstant_4
 
@@ -619,7 +619,7 @@ proc create_root_design { parentCell } {
   # Create instance: xlconstant_5, and set properties
   set xlconstant_5 [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 xlconstant_5 ]
   set_property -dict [list \
-    CONFIG.CONST_VAL {0x3E400000} \
+    CONFIG.CONST_VAL {0x1F400000} \
     CONFIG.CONST_WIDTH {32} \
   ] $xlconstant_5
 
