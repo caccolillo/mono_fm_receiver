@@ -15,6 +15,79 @@
 #include <math.h>
 #include <string.h>
 
+/* ---------------------------------------------------------------------
+ * De-emphasis time-constant correction: 75 us -> 50 us
+ * ---------------------------------------------------------------------
+ * The PL's de_emph block is built for tau = 75 us (North America):
+ *
+ *     de_emph.vhd:  b0 = 0.234071661635351
+ *                   a1 = 0.765928338364649   = exp(-1/(50000*75e-6))
+ *
+ * UK/European FM broadcasts use tau = 50 us. Applying a 75 us
+ * de-emphasis to a 50 us pre-emphasised signal over-attenuates the
+ * treble -- about 3.3 dB down by 10 kHz, rising to 3.5 dB at Nyquist.
+ * Audibly dull and bass-heavy.
+ *
+ * Rather than rebuilding the PL, correct it here. Both filters are
+ * first order, so the ratio is also first order and the correction is
+ * EXACT, not an approximation:
+ *
+ *     H_corr(z) = H_50(z) / H_75(z)
+ *               = (1-a50)/(1-a50*z^-1) * (1-a75*z^-1)/(1-a75)
+ *
+ *     y[n] = g*(x[n] - a75*x[n-1]) + a50*y[n-1]
+ *
+ * The zero at a75 cancels the PL's pole; the pole at a50 applies the
+ * correct one. Verified numerically: |H75 * Hcorr - H50| < 1e-14 dB
+ * across 0-25 kHz.
+ *
+ *     a75 = exp(-1/(fs*75e-6)) = 0.765928338364649
+ *     a50 = exp(-1/(fs*50e-6)) = 0.670320046035639
+ *     g   = (1-a50)/(1-a75)    = 1.408457357294079
+ *
+ * Applied at 50 kHz, BEFORE resampling, because that is the rate the
+ * PL filter was designed at and the rate these coefficients are valid
+ * for. Doing it after resampling to 48 kHz would need different
+ * coefficients and would be correcting a signal that had already been
+ * band-limited.
+ *
+ * NOTE ON WHAT THIS DOES AND DOES NOT FIX: it recovers 3.5 dB of
+ * treble, which is real but modest. It does NOT explain a large
+ * measured roll-off above a few kHz -- if the audio is still dull
+ * after this, the audio LPF cutoff is the next thing to check, and
+ * that one does need an RTL change. Boosting treble also boosts
+ * whatever noise sits under it, so if the top end is buried in the
+ * noise floor this will surface hiss rather than detail.
+ *
+ * Set DEEMPH_CORRECT to 0 to disable and compare directly.
+ * ------------------------------------------------------------------ */
+#define DEEMPH_CORRECT 1
+
+#define DEEMPH_A75  0.765928338364649
+#define DEEMPH_A50  0.670320046035639
+#define DEEMPH_G    1.408457357294079
+
+static void deemph_75_to_50(int16_t *buf, int n)
+{
+    double x_prev = 0.0;   /* x[n-1] */
+    double y_prev = 0.0;   /* y[n-1] */
+
+    for (int i = 0; i < n; i++) {
+        double x = (double)buf[i];
+        double y = DEEMPH_G * (x - DEEMPH_A75 * x_prev) + DEEMPH_A50 * y_prev;
+        x_prev = x;
+        y_prev = y;
+
+        /* Saturate. The correction has up to +3.5 dB of gain, so a
+         * signal already near full scale can clip here. Wrapping would
+         * be far worse than clipping -- a wrap is a full-scale
+         * discontinuity that clicks. */
+        if (y >  32767.0) y =  32767.0;
+        if (y < -32768.0) y = -32768.0;
+        buf[i] = (int16_t)lround(y);
+    }
+}
+
 static int resample_core(const int16_t *in, int n_in,
                           int16_t *out, int max_out)
 {
@@ -137,6 +210,14 @@ int resample_wav_50k_to_48k(const char *in_path, const char *out_path)
     }
     fclose(fin);
     fin = NULL;
+
+#if DEEMPH_CORRECT
+    /* Correct 75 us -> 50 us de-emphasis at the native 50 kHz rate,
+     * before any resampling. See the long comment above the function. */
+    deemph_75_to_50(in_buf, n_in);
+    printf("resample: applied 75us -> 50us de-emphasis correction "
+           "(+3.5 dB max treble)\n");
+#endif
 
     max_out = (int)(((int64_t)n_in * RESAMP_L) / RESAMP_M) + 4;
     out_buf = (int16_t *)malloc((size_t)max_out * sizeof(int16_t));
