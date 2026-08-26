@@ -86,6 +86,36 @@
  *   - The dvb_usb_rtl28xxu kernel module blacklisted, or it will claim
  *     the device first and librtlsdr will fail to open it.
  *
+ * ---------------------------------------------------------------------
+ * STATE OF THIS FILE
+ * ---------------------------------------------------------------------
+ * Two changes from the first working version, in order of importance:
+ *
+ *   1. AUDIO DESTINATION ADDRESS -- fixed, and this was a real bug.
+ *      The drain path was selecting between audio_dest and
+ *      audio_dest + 50, treating the audio destination as a ping/pong
+ *      pair. It is not one: audio_ppdma mirrors every completed block
+ *      to a single fixed dest_base and only then flips the flag, so a
+ *      consumer must always read the same address. See the long
+ *      comment at the drain call site.
+ *
+ *   2. BLOCKING REFILL -- interim, not a fix. refill_iq_buffer now
+ *      waits for a full buffer rather than zero-padding. This exists
+ *      only because the fabric currently free-runs at roughly 335 kHz
+ *      while the SDR delivers 250 kHz, so the ring drains empty on
+ *      every refill. Padding put ~39% zeros into every buffer;
+ *      blocking instead lets the fabric re-read the previous buffer.
+ *      Measured: 99 spur groups -> 12, and 6.7 dB less artefact level.
+ *      But it makes the capture run slower than real time, so the
+ *      audio is time-distorted.
+ *
+ * THE PROPER FIX for (2) is in the PL, not here: gate
+ * iq_ppdma_0/ap_start with a 400-cycle counter (100 MHz / 400 =
+ * exactly 250 kHz) instead of tying it high with an xlconstant. Then
+ * the fabric consumes at the rate the design assumes, the ring never
+ * runs dry, and padding-versus-blocking stops mattering. Once that is
+ * in, revert this to the simple non-blocking form.
+ *
  * Build: gcc -O2 -o fmdemod-rtlsdr fmdemod-rtlsdr.c \
  *            resample_50k_to_48k.c -lgpiod -lrtlsdr -lpthread -lm
  */
@@ -363,8 +393,48 @@ static void *reader_thread(void *arg)
 /* ------------------------------------------------------------------ */
 static uint32_t iq_packed[IQ_BUF_SIZE_WORDS];
 
+/* DIAGNOSTIC BUILD -- blocks for a full buffer instead of zero-padding.
+ *
+ * WHY: the fabric free-runs at roughly 335 kHz while the SDR delivers
+ * 250 kHz, so the ring drains empty on every refill and ~39% of every
+ * buffer was being filled with zeros. That is a hard step from real
+ * samples to silence and back at EVERY buffer boundary. The buffer
+ * period is 2500 pairs at 250 kHz = 10 ms on the input side, which
+ * after R=5 decimation and 50-sample audio blocks lands as a 1 kHz
+ * comb through the whole audio band -- measured at ~+20 dB above the
+ * local noise floor at 500 Hz, 1500 Hz, 2500 Hz and every 1 kHz step
+ * up to 19.5 kHz. That comb IS the periodic sound, and it was present
+ * at full strength with the antenna DISCONNECTED, which is what proves
+ * it is generated here rather than received.
+ *
+ * WHAT THIS BUILD DOES: waits for a complete buffer rather than
+ * padding. The capture then runs SLOWER THAN REAL TIME and the audio
+ * is time-distorted -- the fabric still consumes faster than the SDR
+ * supplies, so this fixes nothing. It only answers one question:
+ *
+ *   comb GONE     -> zero-padding was the sole cause. The PL rate
+ *                    limiter (gate iq_ppdma_0/ap_start with a
+ *                    400-cycle counter for exactly 250 kHz) is then
+ *                    the complete fix.
+ *   comb SURVIVES -> something else produces a per-block
+ *                    discontinuity, most likely the ping-pong
+ *                    handshake: drain_audio_block() reads whichever
+ *                    buffer the GPIO flag says is inactive, with no
+ *                    protection against that flag changing mid-read.
+ *                    Worth fixing BEFORE spending a Vivado rebuild.
+ *
+ * NOT FOR NORMAL USE -- revert to the padding version, or better to a
+ * rate-limited fabric, once the question is answered.
+ */
 static void refill_iq_buffer(volatile uint32_t *dest)
 {
+    /* Block until a whole buffer is available. g_running is checked so
+     * Ctrl-C still works rather than hanging here indefinitely if the
+     * SDR stops delivering. */
+    while (ring_count() < IQ_BUF_SIZE_WORDS && g_running) {
+        usleep(100);
+    }
+
     uint32_t t         = __atomic_load_n(&g_ring_tail, __ATOMIC_RELAXED);
     uint32_t available = ring_count();
     uint32_t n         = (available < IQ_BUF_SIZE_WORDS)
@@ -373,9 +443,9 @@ static void refill_iq_buffer(volatile uint32_t *dest)
     for (uint32_t i = 0; i < n; i++) {
         iq_packed[i] = g_ring[(t + i) % RING_PAIRS];
     }
-    /* Underrun: pad with zeros. Silence for a fraction of a buffer is
-     * far less objectionable than repeating stale samples, which puts a
-     * discontinuity through the discriminator and clicks. */
+    /* Only reachable now if g_running went false during the wait above
+     * (i.e. shutdown). Kept so the shutdown path cannot push an
+     * uninitialised buffer tail at the fabric. */
     if (n < IQ_BUF_SIZE_WORDS) {
         memset(&iq_packed[n], 0, (IQ_BUF_SIZE_WORDS - n) * sizeof(uint32_t));
         __atomic_fetch_add(&g_stat_underruns, IQ_BUF_SIZE_WORDS - n,
@@ -668,10 +738,38 @@ int main(int argc, char **argv)
                 break;
             }
             if (audio_now != audio_prev) {
-                volatile uint32_t *ready = (audio_now == 0)
-                    ? audio_dest
-                    : audio_dest + AUDIO_SAMPLES_PER_BUFFER;
-                if (drain_audio_block(ready, fout, &total_audio_bytes) != 0) break;
+                /* BUG FIX: always read the SAME address.
+                 *
+                 * This previously selected between audio_dest and
+                 * audio_dest + AUDIO_SAMPLES_PER_BUFFER, carrying over
+                 * the ping/pong pattern from the I/Q side. The audio
+                 * side does not work that way. From audio_ppdma.cpp:
+                 *
+                 *   "the just-completed buffer is burst-copied to the
+                 *    fixed dest_base address before the active buffer
+                 *    flips. A consumer that always reads dest_base
+                 *    therefore only ever sees a complete, stable 1 ms
+                 *    block -- it never needs to know ping/pong exist."
+                 *   "active_buf flips only after the copy finishes
+                 *    (atomic hand-off)"
+                 *
+                 * So audio_ppdma mirrors EVERY completed block to one
+                 * fixed address and only then toggles the flag. The
+                 * offset version therefore read 50 words PAST the
+                 * mirror on alternate blocks -- memory the DMA never
+                 * writes -- giving stale or uninitialised data every
+                 * other block. That is a discontinuity at exactly the
+                 * block period (50 samples at 50 kHz = 1 ms), which is
+                 * a 1 kHz comb through the whole audio band.
+                 *
+                 * The bare-metal main.c, whose audio was correct, reads
+                 * AUDIO_DEST_ADDR unconditionally everywhere -- no
+                 * offset, no selection. Matching that here.
+                 *
+                 * active_buf is still used purely as a "new block
+                 * ready" edge; its VALUE says which buffer is now
+                 * receiving, which the consumer does not care about. */
+                if (drain_audio_block(audio_dest, fout, &total_audio_bytes) != 0) break;
                 audio_block_count++;
                 audio_prev = audio_now;
             }

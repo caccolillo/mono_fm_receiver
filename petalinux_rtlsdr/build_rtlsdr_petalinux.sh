@@ -1,191 +1,249 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# =============================================================================
+# build_rtlsdr_petalinux.sh — Build a STANDALONE PetaLinux image for live FM
+# reception on the Zybo Z7-10 using an RTL-SDR Blog V3.
 #
-# build_rtlsdr_petalinux.sh
+# Signal path: RTL-SDR -> PS USB -> ping-pong DDR buffers -> PL demod chain
+#              -> audio back to DDR -> WAV file.
 #
-# Creates a COMPLETE, STANDALONE PetaLinux project for live FM reception
-# on a Zybo Z7-10: RTL-SDR Blog V3 -> PS USB -> ping-pong DDR -> PL demod
-# chain -> WAV file.
+# Modelled directly on build_petalinux.sh from the file-based project, and
+# carries ALL of its hard-won workarounds -- the --silentconfig hang, the
+# ext4 rootfs switch, the USER_CMDLINE symbol, the Zynq-7000 packaging.
+# Each of those was found by hitting the failure; none should be "cleaned
+# up" without reproducing the failure first.
 #
-# This does not touch, depend on, or share state with any existing
-# PetaLinux project. It builds its own from scratch in ./PROJECT_NAME.
+# WHAT DIFFERS FROM THE FILE-BASED PROJECT
+#   - No rds.wav. The I/Q source is a live USB dongle, so the app needs a
+#     ring buffer and a reader thread rather than a synchronous file read.
+#   - librtlsdr in the rootfs, plus a modprobe blacklist to stop the DVB
+#     driver claiming the dongle first.
+#   - USB host node in the device tree. DTG generates the controller node
+#     from the XSA but knows nothing about the board-level ULPI PHY, so
+#     that has to be declared by hand.
+#   - Reserved memory at 0x1F000000-0x1F4FFFFF, NOT 0x3E000000. On a 1 GB
+#     board the original addresses collide with U-Boot's own relocation
+#     area, giving "** Reading file would overwrite reserved memory **"
+#     and a failure to load image.ub at all.
+#   - Rootfs sized at 512 MB. The default came out 56 MB and filled during
+#     the very first capture.
 #
-# ---------------------------------------------------------------------
-# WHAT THIS SCRIPT ENCODES
-# ---------------------------------------------------------------------
-# Every setting here was arrived at by hitting the corresponding failure
-# during bring-up. The comments say which failure, because a bare config
-# line tells you nothing about why it must not be changed back:
+# HARDWARE PREREQUISITE THIS SCRIPT CANNOT SATISFY
+#   PS USB0 must be enabled in the block design (MIO 28..39). Without it
+#   there is no USB host controller and the dongle cannot enumerate --
+#   symptom is usbcore registering normally but /sys/bus/usb/devices/
+#   being EMPTY. No software configuration recovers from that.
 #
-#   --template zynq        Zynq-7000, not zynqMP. Wrong template gives a
-#                          64-bit ARM project that will not boot on an A9.
-#   no machine name        There is no Zybo BSP installed. Setting a board
-#                          machine name fails at device-tree generation.
-#                          DTG derives everything it needs from the XSA.
-#   USER_CMDLINE           NOT "CONFIG_SUBSYSTEM_BOOTARGS" -- that symbol
-#                          does not exist. Writing it produces an EMPTY
-#                          kernel command line, no root=, and a VFS panic
-#                          on an otherwise perfectly good boot.
-#   ext4 rootfs            initramfs was never confirmed working here and
-#                          embeds the rootfs in image.ub, which makes it
-#                          large and awkward to modify on the target.
-#   ROOTFS_SIZE 512MB      the default came out at 56 MB and filled up
-#                          during the very first capture.
-#   zynq_fsbl.elf          not zynqmp_fsbl.elf, and NO --pmufw: Zynq-7000
-#                          has no PMU firmware and the flag is rejected.
-#   0x1F000000 buffers     the original 0x3E000000 addresses collide with
-#                          U-Boot's own relocation area near the top of a
-#                          1 GB DDR, giving "Reading file would overwrite
-#                          reserved memory" and a failed image.ub load.
+# EXPECTED LAYOUT
+#   <this directory>/
+#   ├── build_rtlsdr_petalinux.sh
+#   ├── create_sd.sh
+#   ├── sdr_fm_receiver.xsa          (exported from Vivado, with bitstream)
+#   └── src/
+#       ├── fmdemod-rtlsdr.c
+#       ├── resample_50k_to_48k.c
+#       └── resample_coeffs.h
 #
-# ---------------------------------------------------------------------
-# PREREQUISITES
-# ---------------------------------------------------------------------
-#   - PetaLinux 2022.2 settings sourced
-#   - An XSA exported from a Vivado build with PS USB0 ENABLED
-#     (MIO 28..39). Without USB0 in the hardware there is no USB host
-#     controller and the SDR cannot enumerate -- no amount of software
-#     configuration recovers from that.
-#   - The three source files in ./src/
-#
-# ---------------------------------------------------------------------
 # USAGE
-# ---------------------------------------------------------------------
-#   mkdir -p src
-#   cp .../fmdemod-rtlsdr.c .../resample_50k_to_48k.c \
-#      .../resample_coeffs.h src/
-#   cp .../sdr_fm_receiver.xsa .
 #   source /path/to/petalinux/settings.sh
 #   ./build_rtlsdr_petalinux.sh
-#
+# =============================================================================
 
 set -euo pipefail
 
-# ====================================================================
-# Configuration
-# ====================================================================
-PROJECT_NAME="${PROJECT_NAME:-fm_rtlsdr_linux}"
-XSA_FILE="${XSA_FILE:-sdr_fm_receiver.xsa}"
-SRC_DIR="${SRC_DIR:-src}"
-APP_NAME="fmdemod-rtlsdr"
+# ---- Guard against being sourced (the #1 cause of bitbake being stopped) ----
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    echo "ERROR: Do not source this script. Run it directly:"
+    echo "  bash $(basename "${BASH_SOURCE[0]}")"
+    echo "or:  ./$(basename "${BASH_SOURCE[0]}")"
+    echo "Sourcing causes bitbake to be stopped by the shell's job control."
+    return 1 2>/dev/null || exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJ_DIR="${SCRIPT_DIR}/${PROJECT_NAME}"
-XSA_ABS="${SCRIPT_DIR}/${XSA_FILE}"
-LOG_FILE="${SCRIPT_DIR}/build_${PROJECT_NAME}.log"
+LOG_FILE="${SCRIPT_DIR}/build_rtlsdr_petalinux.log"
+echo "=== Started: $(date) ===" > "${LOG_FILE}"
 
-# DDR map -- MUST match bd.tcl's xlconstants and fmdemod-rtlsdr.c.
-# Five places have to agree on these; they have disagreed before.
-IQ_PING_ADDR="0x1F000000"
-IQ_PONG_ADDR="0x1F100000"
-AUDIO_PING_ADDR="0x1F200000"
-AUDIO_PONG_ADDR="0x1F300000"
-AUDIO_DEST_ADDR="0x1F400000"
+# ---- Colours / helpers -------------------------------------------------------
+RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'; NC='\033[0m'
+info()  { echo -e "${GRN}[INFO]${NC}  $*" | tee -a "${LOG_FILE}"; }
+warn()  { echo -e "${YLW}[WARN]${NC}  $*" | tee -a "${LOG_FILE}"; }
+error() { echo -e "${RED}[ERROR]${NC} $*" | tee -a "${LOG_FILE}"; exit 1; }
+step()  { echo -e "\n${YLW}========================================${NC}" | tee -a "${LOG_FILE}"; \
+          echo -e "${YLW} $*${NC}" | tee -a "${LOG_FILE}"; \
+          echo -e "${YLW}========================================${NC}" | tee -a "${LOG_FILE}"; }
 
-# ====================================================================
-# Helpers
-# ====================================================================
-step() { echo "" | tee -a "${LOG_FILE}"; echo "=== $* ===" | tee -a "${LOG_FILE}"; }
-info() { echo "  $*" | tee -a "${LOG_FILE}"; }
-warn() { echo "  WARNING: $*" | tee -a "${LOG_FILE}" >&2; }
-die()  { echo "  ERROR: $*" | tee -a "${LOG_FILE}" >&2; exit 1; }
+# ---- Configuration -- adjust these for your environment ---------------------
+PROJECT_NAME="${PROJECT_NAME:-fm_rtlsdr_linux}"
+XSA_PATH="${XSA_PATH:-./sdr_fm_receiver.xsa}"
+# Resolve to absolute path NOW, before any cd changes the working directory.
+XSA_ABS="$(readlink -f "${XSA_PATH}")"
+APP_NAME="fmdemod-rtlsdr"
+APP_SRC_DIR="${SCRIPT_DIR}/src"
 
-: > "${LOG_FILE}"
+# ---- 1. Validate -------------------------------------------------------------
+step "1/8  Validating prerequisites"
 
-# ====================================================================
-step "0/9  Preflight"
-# ====================================================================
-command -v petalinux-create >/dev/null 2>&1 || \
-    die "petalinux-create not on PATH. Source PetaLinux settings.sh first."
+if [ ! -f "${XSA_ABS}" ]; then
+    error "XSA not found at ${XSA_ABS} -- export it from Vivado first \
+(File -> Export -> Export Hardware, include bitstream), then point \
+XSA_PATH at the resulting .xsa."
+fi
 
-info "PetaLinux: $(petalinux-util --webtalk off >/dev/null 2>&1; \
-    petalinux-create --version 2>&1 | head -1 || echo 'version unknown')"
-
-[ -f "${XSA_ABS}" ] || die "XSA not found: ${XSA_ABS}"
-info "XSA: ${XSA_ABS}"
-
-for f in fmdemod-rtlsdr.c resample_50k_to_48k.c resample_coeffs.h; do
-    [ -f "${SCRIPT_DIR}/${SRC_DIR}/${f}" ] || \
-        die "Missing source: ${SRC_DIR}/${f}"
+# Preflight the app sources before starting any petalinux work, so a
+# missing file fails immediately rather than halfway through a long build.
+for f in "fmdemod-rtlsdr.c" "resample_50k_to_48k.c" "resample_coeffs.h"; do
+    if [ ! -f "${APP_SRC_DIR}/${f}" ]; then
+        error "App source file not found: ${APP_SRC_DIR}/${f}\n\
+Expected directory layout:\n\
+  ${SCRIPT_DIR}/\n\
+  ├── build_rtlsdr_petalinux.sh\n\
+  ├── create_sd.sh\n\
+  ├── sdr_fm_receiver.xsa\n\
+  └── src/\n\
+      ├── fmdemod-rtlsdr.c\n\
+      ├── resample_50k_to_48k.c\n\
+      └── resample_coeffs.h"
+    fi
 done
-info "Sources present in ${SRC_DIR}/"
 
-# The XSA must contain a USB0 node or the whole exercise is pointless.
-# Checking now costs a second; discovering it after a 2 hour build does
-# not. The XSA is a zip; the .hwh inside lists the PS peripherals.
+if ! command -v petalinux-create >/dev/null 2>&1; then
+    error "petalinux-create not found. Source your PetaLinux settings.sh \
+first (e.g. 'source /tools/Xilinx/PetaLinux/2022.2/settings.sh')."
+fi
+
+# Best-effort check that the XSA actually has USB0. This is the single
+# prerequisite the script cannot fix for you, and discovering it is
+# missing AFTER a multi-hour build is an expensive way to find out. The
+# check greps the .hwh inside the XSA archive, so treat it as indicative
+# rather than authoritative -- verify in Vivado if it warns.
 if command -v unzip >/dev/null 2>&1; then
-    if unzip -p "${XSA_ABS}" '*.hwh' 2>/dev/null | grep -qi "USB0_PERIPHERAL_ENABLE.*1\|PCW_EN_USB0.*1"; then
-        info "XSA reports PS USB0 enabled -- good"
+    if unzip -p "${XSA_ABS}" '*.hwh' 2>/dev/null | \
+         grep -qi 'PCW_USB0_PERIPHERAL_ENABLE.*>1<\|PCW_EN_USB0.*>1<'; then
+        info "XSA reports PS USB0 enabled"
     else
-        warn "Could not confirm PS USB0 is enabled in the XSA."
-        warn "If /sys/bus/usb/devices/ is empty on the target, this is why:"
-        warn "  set PCW_USB0_PERIPHERAL_ENABLE {1} and PCW_USB0_USB0_IO"
-        warn "  {MIO 28 .. 39} in the block design, rebuild, re-export."
+        warn "Could not confirm PS USB0 is enabled in this XSA."
+        warn "If /sys/bus/usb/devices/ is empty on the target, this is why."
+        warn "Fix in vivado/end_system/bd.tcl:"
+        warn "  CONFIG.PCW_USB0_PERIPHERAL_ENABLE {1}"
+        warn "  CONFIG.PCW_USB0_USB0_IO {MIO 28 .. 39}"
+        warn "then rebuild end_system and re-export."
         read -r -p "  Continue anyway? [y/N] " reply
         [ "${reply}" = "y" ] || [ "${reply}" = "Y" ] || exit 1
     fi
 fi
 
-if [ -d "${PROJ_DIR}" ]; then
-    warn "${PROJ_DIR} already exists."
+if [ -d "${SCRIPT_DIR}/${PROJECT_NAME}" ]; then
+    warn "${SCRIPT_DIR}/${PROJECT_NAME} already exists."
     read -r -p "  Delete and recreate? [y/N] " reply
     if [ "${reply}" = "y" ] || [ "${reply}" = "Y" ]; then
-        rm -rf "${PROJ_DIR}"
+        rm -rf "${SCRIPT_DIR:?}/${PROJECT_NAME}"
     else
-        die "Aborting to avoid clobbering an existing project."
+        error "Aborting rather than clobbering an existing project."
     fi
 fi
 
-# ====================================================================
-step "1/9  Create project"
-# ====================================================================
+info "XSA:     ${XSA_ABS}"
+info "Project: ${SCRIPT_DIR}/${PROJECT_NAME}"
+info "Log:     ${LOG_FILE}"
+
+# ---- 2. Create the project ---------------------------------------------------
+step "2/8  Creating PetaLinux project"
+
 # --template zynq: Zynq-7000 / Cortex-A9. NOT zynqMP -- that scaffolds a
-# 64-bit project with an ATF and PMU firmware that do not exist on this
-# part, and fails late and confusingly.
+# 64-bit project expecting an ATF and PMU firmware that do not exist on
+# this part, and fails late and confusingly.
 cd "${SCRIPT_DIR}"
 petalinux-create -t project --template zynq -n "${PROJECT_NAME}" 2>&1 | tee -a "${LOG_FILE}"
-info "Created ${PROJ_DIR}"
+cd "${SCRIPT_DIR}/${PROJECT_NAME}"
+info "Project created"
 
-CONFIG_FILE="${PROJ_DIR}/project-spec/configs/config"
+# ---- WORKAROUND for a confirmed --silentconfig infinite-loop bug ------
+#
+# Carried over verbatim from build_petalinux.sh, where this cost a
+# multi-hour hang and a 97 GB config.log before being diagnosed.
+#
+# Root cause: SUBSYSTEM_UBOOT_DEVICETREE_OFFSET has an empty ([]) default
+# in this project's u-boot Kconfig. --silentconfig is supposed to
+# auto-accept the bracketed default for every prompt without asking a
+# human -- but it cannot resolve an EMPTY default for this specific
+# string-type option, so instead of accepting it or failing cleanly it
+# re-prints the identical prompt forever:
+#   "Devicetree offset (SUBSYSTEM_UBOOT_DEVICETREE_OFFSET) [] (NEW)"
+#
+# Fix: pre-seed a real value BEFORE the first petalinux-config call.
+# --silentconfig reuses whatever is already on record for a symbol
+# rather than treating it as new, so the broken empty-default path never
+# triggers. 0x0 (no offset beyond U-Boot's own default placement) is the
+# inert choice unless you specifically need something else.
+#
+# The config file does not exist until the first petalinux-config call
+# generates it, so create a minimal one by hand here; petalinux-config
+# merges it with everything else it derives from the XSA.
+mkdir -p project-spec/configs
+CONFIG_FILE="project-spec/configs/config"
+if ! grep -q "^CONFIG_SUBSYSTEM_UBOOT_DEVICETREE_OFFSET=" "${CONFIG_FILE}" 2>/dev/null; then
+    echo 'CONFIG_SUBSYSTEM_UBOOT_DEVICETREE_OFFSET="0x0"' >> "${CONFIG_FILE}"
+    info "Pre-seeded SUBSYSTEM_UBOOT_DEVICETREE_OFFSET=0x0 (works around the"
+    info "--silentconfig infinite-loop bug -- do not remove this)"
+fi
 
-# ====================================================================
-step "2/9  Import hardware description"
-# ====================================================================
-# Quiet for a while even when working. --silentconfig suppresses the
-# interactive menu; stdbuf forces what it does print to appear live
-# rather than sitting in a pipe buffer for two minutes.
-cd "${PROJ_DIR}"
+# ---- Machine name: leave at the default -------------------------------------
+# The Ultra96 project set CONFIG_SUBSYSTEM_MACHINE_NAME to pick up a board
+# BSP device tree, because the Avnet BSP was installed and the board
+# needed SD 1.8V signalling config that only the BSP DTS provided.
+#
+# Neither applies here. There is no Zybo BSP installed (checked: no zybo
+# machine conf under meta-xilinx-bsp), so setting a board machine name
+# fails at device-tree generation. And SD 1.8V signalling is a ZynqMP
+# concern -- Zynq-7000's SDIO controller has no 1.8V mode at all.
+#
+# For a custom block design the right answer is to let DTG derive the
+# device tree from the XSA. The reserved-memory and USB overlays below
+# supply the only board-specific bindings this application needs.
+info "Leaving CONFIG_SUBSYSTEM_MACHINE_NAME at default -- DTG will derive"
+info "the device tree from the XSA (no Zybo BSP installed, none needed)"
+
+# ---- ext4 two-partition rootfs, and an EXPLICIT kernel command line ----
+#
+# CONFIG_SUBSYSTEM_USER_CMDLINE is the real Kconfig symbol. An earlier
+# revision of the sibling script wrote CONFIG_SUBSYSTEM_BOOTARGS, which
+# is NOT a symbol -- Kconfig silently discarded it, left USER_CMDLINE
+# empty, and the kernel booted all the way to
+#   "VFS: Cannot open root device (null) ... Kernel panic"
+# on an otherwise perfectly good boot. CONFIG_SUBSYSTEM_BOOTARGS_AUTO is
+# real and must stay unset, or it regenerates and overwrites this.
+#
+# ROOTFS_SIZE: the default produced a 56 MB filesystem that filled during
+# the first capture (df showed 100% with 0 available). A live stream
+# writes ~100 KB/s continuously, so this needs real room.
+if ! grep -q "^CONFIG_SUBSYSTEM_ROOTFS_EXT4=y" "${CONFIG_FILE}" 2>/dev/null; then
+    cat >> "${CONFIG_FILE}" << 'ROOTFSCFG'
+CONFIG_SUBSYSTEM_ROOTFS_EXT4=y
+CONFIG_SUBSYSTEM_SDROOT_DEV="/dev/mmcblk0p2"
+CONFIG_SUBSYSTEM_RFS_FORMATS="ext4 ext4.gz"
+CONFIG_SUBSYSTEM_BOOTARGS_AUTO=n
+CONFIG_SUBSYSTEM_USER_CMDLINE="earlycon console=ttyPS0,115200 root=/dev/mmcblk0p2 rw rootwait"
+CONFIG_SUBSYSTEM_ROOTFS_SIZE=524288
+ROOTFSCFG
+    info "Pre-seeded ext4 rootfs (512 MB) with an explicit root= cmdline"
+fi
+
+# ---- 3. Import the hardware description -------------------------------------
+step "3/8  Importing hardware description"
+info "Quiet for a while even when working (--silentconfig suppresses the"
+info "usual interactive menu output). stdbuf forces whatever it DOES"
+info "print to appear live rather than sitting buffered."
 stdbuf -oL -eL petalinux-config --get-hw-description="${XSA_ABS}" \
     --silentconfig 2>&1 | tee -a "${LOG_FILE}"
 info "Hardware description imported"
 
-# ====================================================================
-step "3/9  Root filesystem and boot arguments"
-# ====================================================================
-# CONFIG_SUBSYSTEM_USER_CMDLINE is the real Kconfig symbol. An earlier
-# script wrote CONFIG_SUBSYSTEM_BOOTARGS, which is NOT a symbol -- Kconfig
-# silently discarded it, left USER_CMDLINE empty, and the kernel booted
-# all the way to "VFS: Cannot open root device (null)" before failing.
-# CONFIG_SUBSYSTEM_BOOTARGS_AUTO is real and defaults to unset, which is
-# what we want -- setting it would regenerate and overwrite our cmdline.
-{
-    echo 'CONFIG_SUBSYSTEM_ROOTFS_EXT4=y'
-    echo 'CONFIG_SUBSYSTEM_SDROOT_DEV="/dev/mmcblk0p2"'
-    echo 'CONFIG_SUBSYSTEM_RFS_FORMATS="ext4 ext4.gz"'
-    echo '# CONFIG_SUBSYSTEM_BOOTARGS_AUTO is not set'
-    echo 'CONFIG_SUBSYSTEM_USER_CMDLINE="earlycon console=ttyPS0,115200 root=/dev/mmcblk0p2 rw rootwait"'
-    # 56 MB was the default and it filled during the first capture. A
-    # live stream writes continuously, so give it real room.
-    echo 'CONFIG_SUBSYSTEM_ROOTFS_SIZE=524288'
-} >> "${CONFIG_FILE}"
-info "ext4 rootfs, 512 MB, explicit kernel cmdline with root="
+# ---- 4. Device tree overlays + rootfs packages -------------------------------
+step "4/8  Installing device tree overlays and selecting rootfs packages"
 
-# ====================================================================
-step "4/9  Device tree: reserved memory + USB host"
-# ====================================================================
-DT_DIR="${PROJ_DIR}/project-spec/meta-user/recipes-bsp/device-tree/files"
-mkdir -p "${DT_DIR}"
+DT_USER_DIR="project-spec/meta-user/recipes-bsp/device-tree/files"
+mkdir -p "${DT_USER_DIR}"
 
-cat >> "${DT_DIR}/system-user.dtsi" << 'DTSI_EOF'
+cat >> "${DT_USER_DIR}/system-user.dtsi" << 'DTSI_EOF'
 
 /* ==================================================================
  * Reserved memory for the ping-pong DDR buffers
@@ -194,14 +252,16 @@ cat >> "${DT_DIR}/system-user.dtsi" << 'DTSI_EOF'
  * IOMMU and no knowledge of Linux. Carving them out of the kernel's
  * allocator is what stops Linux handing the same pages to a process.
  *
- * Addresses are 0x1F000000-0x1F4FFFFF, i.e. near the top of the first
- * 512 MB. NOT the original 0x3E000000 -- on a 1 GB board that region
- * collides with U-Boot's own relocation area, which produces
- * "** Reading file would overwrite reserved memory **" and a failure to
- * load image.ub at all.
+ * 0x1F000000-0x1F4FFFFF, NOT the original 0x3E000000. On a 1 GB board
+ * the old addresses collide with U-Boot's own relocation area near the
+ * top of DDR, which produces
+ *     ** Reading file would overwrite reserved memory **
+ *     Failed to load 'image.ub'
+ * and the board never reaches the kernel at all.
  *
- * MUST match the xlconstant values in bd.tcl and the #defines in
- * fmdemod-rtlsdr.c. All three have to agree.
+ * MUST match the xlconstant values in vivado/end_system/bd.tcl and the
+ * #defines in fmdemod-rtlsdr.c. Three places, all of which have to
+ * agree, and which have disagreed before.
  * ================================================================== */
 / {
     reserved-memory {
@@ -238,15 +298,15 @@ cat >> "${DT_DIR}/system-user.dtsi" << 'DTSI_EOF'
  * Zynq-7000's USB is a ChipIdea core driving an EXTERNAL ULPI PHY
  * (USB3320 on the Zybo). DTG generates the controller node from the
  * XSA, but the PHY is a board-level part the XSA knows nothing about,
- * so its node has to be declared by hand here.
+ * so its node has to be declared here by hand.
  *
- * Symptom if this is missing: dmesg shows usbcore and ehci_hcd
+ * Symptom when this is missing: dmesg shows usbcore and ehci_hcd
  * registering normally, but /sys/bus/usb/devices/ is EMPTY -- there is
- * no host controller instance for anything to attach to.
+ * no host controller instance for anything to attach to. That was the
+ * exact state on the first Linux boot of this design.
  *
- * Requires PCW_USB0_PERIPHERAL_ENABLE in the block design. This
- * fragment alone is not enough; it references a usb0 node that only
- * exists if the hardware enabled it.
+ * This fragment alone is NOT sufficient: it references a usb0 node that
+ * only exists if PCW_USB0_PERIPHERAL_ENABLE is set in the block design.
  * ================================================================== */
 / {
     usb_phy0: usb_phy@0 {
@@ -266,22 +326,53 @@ cat >> "${DT_DIR}/system-user.dtsi" << 'DTSI_EOF'
 DTSI_EOF
 info "system-user.dtsi written (reserved memory + USB host)"
 
-# ====================================================================
-step "5/9  librtlsdr"
-# ====================================================================
+# ---- Rootfs package selection ------------------------------------------------
+# rootfs_config + petalinux-config -c rootfs is the PetaLinux-native
+# mechanism, and keeps the selection visible in the project config rather
+# than buried in a bbappend.
+#
+# Keep dropbear (the PetaLinux default) and use dropbear-scp for file
+# transfer rather than openssh-sftp-server. You WILL want scp: there is
+# no audio hardware on this board, so listening to a capture means
+# copying the WAV off to a host.
+#
+# gpiod-tools and usbutils are bring-up instrumentation rather than
+# runtime dependencies, and they earn their space: the AXI GPIO chip
+# index was guessed wrong once already, and having no gpiodetect on the
+# target to check it cost real time. Same for lsusb -- proving the
+# dongle enumerated before blaming the application is the first useful
+# step. resize2fs is there because the rootfs filled mid-capture with no
+# way to grow it in place.
+ROOTFS_CONFIG="project-spec/configs/rootfs_config"
+for pkg in \
+    CONFIG_librtlsdr \
+    CONFIG_libgpiod \
+    CONFIG_gpiod-tools \
+    CONFIG_e2fsprogs-resize2fs \
+    CONFIG_usbutils \
+    CONFIG_dropbear-scp \
+    CONFIG_udhcpc \
+    CONFIG_i2c-tools
+do
+    if ! grep -q "^${pkg}=y" "${ROOTFS_CONFIG}" 2>/dev/null; then
+        echo "${pkg}=y" >> "${ROOTFS_CONFIG}"
+        info "Enabled package: ${pkg}"
+    fi
+done
+
+# ---- 5. librtlsdr and the DVB blacklist --------------------------------------
+step "5/8  librtlsdr recipe and DVB driver blacklist"
+
 # PetaLinux bundles meta-openembedded, which may already provide
 # librtlsdr. Two recipes for one package is a hard build failure, not a
 # warning, so check before adding ours.
-cd "${PROJ_DIR}"
-HAVE_LIBRTLSDR=0
 if bitbake-layers show-recipes 2>/dev/null | grep -qi "^librtlsdr"; then
-    HAVE_LIBRTLSDR=1
     info "librtlsdr already provided by an existing layer -- not adding ours"
 else
     info "librtlsdr not found in existing layers -- adding a recipe"
-    RECIPE_DIR="${PROJ_DIR}/project-spec/meta-user/recipes-support/librtlsdr"
-    mkdir -p "${RECIPE_DIR}"
-    cat > "${RECIPE_DIR}/librtlsdr_0.6.0.bb" << 'RTLSDR_EOF'
+    RTLSDR_DIR="project-spec/meta-user/recipes-support/librtlsdr"
+    mkdir -p "${RTLSDR_DIR}"
+    cat > "${RTLSDR_DIR}/librtlsdr_0.6.0.bb" << 'RTLSDR_EOF'
 SUMMARY = "Userspace driver for RTL2832U-based SDR receivers"
 HOMEPAGE = "https://osmocom.org/projects/rtl-sdr/wiki"
 SECTION = "libs"
@@ -291,7 +382,8 @@ LIC_FILES_CHKSUM = "file://COPYING;md5=751419260aa954499f7abaabaa882bbe"
 DEPENDS = "libusb1"
 
 # Pinned revision rather than a moving branch, so the build is
-# reproducible. Needs network access to gitea.osmocom.org at build time.
+# reproducible. Needs network access to gitea.osmocom.org at build time;
+# mirror the tarball and change SRC_URI if your build host is offline.
 SRC_URI = "git://gitea.osmocom.org/sdr/rtl-sdr.git;protocol=https;branch=master"
 SRCREV = "0847e93e0869feab50fd27c7afeb85d78ca04631"
 
@@ -301,8 +393,8 @@ inherit cmake pkgconfig
 
 # DETACH_KERNEL_DRIVER lets librtlsdr kick dvb_usb_rtl28xxu off the
 # device if the kernel claimed it first. Belt and braces alongside the
-# modprobe blacklist -- either alone usually suffices, both together
-# survives an image rebuild that drops the blacklist file.
+# modprobe blacklist below -- either alone usually suffices, both
+# together survives an image rebuild that drops the blacklist file.
 EXTRA_OECMAKE = " \
     -DDETACH_KERNEL_DRIVER=ON \
     -DINSTALL_UDEV_RULES=ON \
@@ -311,18 +403,15 @@ EXTRA_OECMAKE = " \
 FILES:${PN} += "${libdir}/librtlsdr.so.* ${sysconfdir}/udev/rules.d"
 FILES:${PN}-dev += "${libdir}/librtlsdr.so ${includedir}/rtl-sdr*.h"
 RTLSDR_EOF
-    info "Recipe written to recipes-support/librtlsdr/"
+    info "librtlsdr recipe written"
 fi
 
-# ====================================================================
-step "6/9  Blacklist the DVB-T driver"
-# ====================================================================
 # dvb_usb_rtl28xxu claims the RTL2832U as a DVB-T receiver the instant it
-# enumerates, and librtlsdr then cannot open it. Blacklisting avoids the
-# race entirely rather than relying on DETACH_KERNEL_DRIVER to win it.
-BL_DIR="${PROJ_DIR}/project-spec/meta-user/recipes-core/rtlsdr-blacklist"
+# enumerates, and librtlsdr then cannot open it (rtl_test reports "device
+# is busy"). Blacklisting avoids the race rather than relying on
+# DETACH_KERNEL_DRIVER to win it.
+BL_DIR="project-spec/meta-user/recipes-core/rtlsdr-blacklist"
 mkdir -p "${BL_DIR}/files"
-
 cat > "${BL_DIR}/files/blacklist-rtl28xxu.conf" << 'BL_EOF'
 # Keep the DVB-T stack off the RTL2832U so librtlsdr can claim it.
 blacklist dvb_usb_rtl28xxu
@@ -346,22 +435,38 @@ do_install() {
 
 FILES:${PN} = "${sysconfdir}/modprobe.d/blacklist-rtl28xxu.conf"
 BLREC_EOF
-info "Blacklist recipe written"
+info "DVB blacklist recipe written"
 
-# ====================================================================
-step "7/9  Application recipe"
-# ====================================================================
-APP_DIR="${PROJ_DIR}/project-spec/meta-user/recipes-apps/${APP_NAME}"
-mkdir -p "${APP_DIR}/files"
+# The blacklist package is ours, not a known OE package, so it has no
+# Kconfig entry and goes in via IMAGE_INSTALL rather than rootfs_config.
+BSPCONF="project-spec/meta-user/conf/petalinuxbsp.conf"
+mkdir -p "$(dirname "${BSPCONF}")"
+if ! grep -q "rtlsdr-blacklist" "${BSPCONF}" 2>/dev/null; then
+    echo 'IMAGE_INSTALL:append = " rtlsdr-blacklist"' >> "${BSPCONF}"
+fi
 
-cp "${SCRIPT_DIR}/${SRC_DIR}/fmdemod-rtlsdr.c"     "${APP_DIR}/files/"
-cp "${SCRIPT_DIR}/${SRC_DIR}/resample_50k_to_48k.c" "${APP_DIR}/files/"
-cp "${SCRIPT_DIR}/${SRC_DIR}/resample_coeffs.h"     "${APP_DIR}/files/"
+info "Running rootfs config (quiet for a bit, same reason as step 3)"
+stdbuf -oL -eL petalinux-config -c rootfs --silentconfig 2>&1 | tee -a "${LOG_FILE}"
+info "Rootfs config complete"
 
-cat > "${APP_DIR}/files/Makefile" << 'MAKE_EOF'
+# ---- 6. Application recipe ---------------------------------------------------
+step "6/8  Creating ${APP_NAME} app recipe"
+
+APP_RECIPE_DIR="project-spec/meta-user/recipes-apps/${APP_NAME}"
+APP_FILES_DIR="${APP_RECIPE_DIR}/files"
+mkdir -p "${APP_FILES_DIR}"
+
+cp "${APP_SRC_DIR}/fmdemod-rtlsdr.c"      "${APP_FILES_DIR}/"
+cp "${APP_SRC_DIR}/resample_50k_to_48k.c" "${APP_FILES_DIR}/"
+cp "${APP_SRC_DIR}/resample_coeffs.h"     "${APP_FILES_DIR}/"
+info "Installed app sources into the recipe"
+
+cat > "${APP_FILES_DIR}/Makefile" << 'MAKE_EOF'
 # Two translation units: the capture/demod driver and the resampler.
-# -lpthread is needed for the librtlsdr reader thread, -lm for lround()
-# in the resampler.
+#   -lgpiod    ping-pong handshake lines
+#   -lrtlsdr   the dongle
+#   -lpthread  the librtlsdr async reader runs on its own thread
+#   -lm        lround() in the resampler
 CFLAGS  += -O2 -Wall -Wextra
 LDLIBS  += -lgpiod -lrtlsdr -lpthread -lm
 
@@ -380,8 +485,9 @@ clean:
 
 .PHONY: all clean
 MAKE_EOF
+info "Wrote app Makefile"
 
-cat > "${APP_DIR}/${APP_NAME}.bb" << 'APP_EOF'
+cat > "${APP_RECIPE_DIR}/${APP_NAME}.bb" << 'APP_EOF'
 SUMMARY = "Live FM demodulator: RTL-SDR -> PL demod chain -> WAV"
 SECTION = "PETALINUX/apps"
 LICENSE = "MIT"
@@ -396,7 +502,6 @@ SRC_URI = " \
 
 S = "${WORKDIR}"
 
-# libgpiod for the ping-pong handshake lines, librtlsdr for the dongle.
 DEPENDS = "libgpiod librtlsdr"
 RDEPENDS:${PN} = "libgpiod librtlsdr"
 
@@ -411,51 +516,46 @@ do_install() {
 
 FILES:${PN} = "${bindir}/fmdemod-rtlsdr"
 APP_EOF
-info "App recipe written with both source files"
 
-# ====================================================================
-step "8/9  Rootfs package selection"
-# ====================================================================
-BSPCONF="${PROJ_DIR}/project-spec/meta-user/conf/petalinuxbsp.conf"
-mkdir -p "$(dirname "${BSPCONF}")"
+if ! grep -q "${APP_NAME}" "${BSPCONF}" 2>/dev/null; then
+    echo "IMAGE_INSTALL:append = \" ${APP_NAME}\"" >> "${BSPCONF}"
+fi
+info "App recipe written and added to IMAGE_INSTALL"
 
-cat >> "${BSPCONF}" << 'BSP_EOF'
+# ---- 7. Build ----------------------------------------------------------------
+step "7/8  Building (this takes a while the first time)"
+info "Commonly 30 min to a few hours depending on your machine and"
+info "whether sstate-cache/downloads are already warm from a prior build."
+info "librtlsdr is fetched from git during this step, so the build host"
+info "needs network access the first time through."
 
-# ---- FM receiver runtime and bring-up tooling ----
-#
-# fmdemod-rtlsdr      the application
-# rtlsdr-blacklist    keeps dvb_usb_rtl28xxu off the dongle
-# libgpiod-tools      gpiodetect/gpioinfo. The AXI GPIO chip index was
-#                     guessed wrong once already; not having the tools on
-#                     the target to check it cost real time.
-# e2fsprogs-resize2fs the rootfs filled up mid-capture and there was no
-#                     way to grow it in place.
-# usbutils            lsusb, to prove the dongle enumerated before
-#                     blaming the application.
-IMAGE_INSTALL:append = " \
-    fmdemod-rtlsdr \
-    rtlsdr-blacklist \
-    librtlsdr \
-    libgpiod \
-    libgpiod-tools \
-    e2fsprogs-resize2fs \
-    usbutils \
-"
-BSP_EOF
-info "Runtime packages and bring-up tools added"
+BUILD_START=$(date +%s)
 
-# ====================================================================
-step "9/9  Build and package"
-# ====================================================================
-cd "${PROJ_DIR}"
-info "This takes 1-3 hours on a first build. Logging to ${LOG_FILE}"
-stdbuf -oL -eL petalinux-build 2>&1 | tee -a "${LOG_FILE}"
+# No -v: plain bitbake output already prints one line per task as it
+# starts and finishes, which is the useful "what recipe, what's it doing"
+# visibility. -v additionally dumps the full raw command output under
+# every single task, which turned out to be too much.
+petalinux-build 2>&1 | tee -a "${LOG_FILE}"
+BUILD_EXIT=${PIPESTATUS[0]}
 
-# Zynq-7000 boot image: FSBL + bitstream + U-Boot. NO --pmufw -- that is
-# a ZynqMP-only file and the flag is rejected here. FSBL is zynq_fsbl.elf,
-# not zynqmp_fsbl.elf.
+BUILD_END=$(date +%s)
+BUILD_ELAPSED=$(( BUILD_END - BUILD_START ))
+info "Build step took $(( BUILD_ELAPSED / 60 ))m $(( BUILD_ELAPSED % 60 ))s"
+
+if [ "${BUILD_EXIT}" -ne 0 ]; then
+    error "petalinux-build failed (exit ${BUILD_EXIT}). Check ${LOG_FILE}."
+fi
+
+# ---- 8. Package the boot image ----------------------------------------------
+step "8/8  Packaging BOOT.BIN"
+# zynq_fsbl.elf is the Zynq-7000 FSBL name, and there is deliberately NO
+# --pmufw: PMU firmware has no Zynq-7000 equivalent at all, but is
+# MANDATORY on ZynqMP. Passing it here is rejected outright; omitting it
+# on a ZU+ board gives an FSBL that hangs at startup.
 for f in zynq_fsbl.elf system.bit u-boot.elf; do
-    [ -f "images/linux/${f}" ] || die "images/linux/${f} missing after build"
+    if [ ! -f "images/linux/${f}" ]; then
+        error "Missing build artifact: images/linux/${f}"
+    fi
 done
 
 petalinux-package --boot \
@@ -464,80 +564,49 @@ petalinux-package --boot \
     --u-boot images/linux/u-boot.elf \
     --force 2>&1 | tee -a "${LOG_FILE}"
 
-# ====================================================================
-echo ""
-echo "===================================================================="
-echo "  Build complete"
-echo "===================================================================="
-cat << FINAL_EOF
+info "Done."
+info "Boot image:  images/linux/BOOT.BIN"
+info "Kernel + DT: images/linux/image.ub"
+info "Rootfs:      images/linux/rootfs.ext4"
+warn "REMINDER: this script cannot confirm PS USB0 was actually enabled in"
+warn "the hardware it imported. On the target, the first check that matters"
+warn "is 'ls /sys/bus/usb/devices/' -- if that is EMPTY, go back to the"
+warn "block design; no software change will help."
+echo "=== Finished: $(date) ===" | tee -a "${LOG_FILE}"
+info "Full build log saved to: ${LOG_FILE}"
 
-Images in ${PROJ_DIR}/images/linux/ :
-    BOOT.BIN        -> SD partition 1 (FAT32)
-    image.ub        -> SD partition 1 (FAT32)
-    boot.scr        -> SD partition 1 (FAT32)
-    rootfs.ext4     -> dd onto SD partition 2
-
-SD card layout (two partitions):
-    p1  FAT32,  ~1 GB,  bootable
-    p2  ext4,   rest of the card
-
-    sudo dd if=images/linux/rootfs.ext4 of=/dev/sdXn bs=4M status=progress
-    sync
-
---------------------------------------------------------------------
-VERIFY ON TARGET IN THIS ORDER
---------------------------------------------------------------------
-Each step isolates a different failure. Skipping ahead just makes the
-eventual error harder to attribute.
-
-  1. ls /sys/bus/usb/devices/
-       Non-empty => the USB host controller exists. If EMPTY, the
-       problem is the HARDWARE, not Linux: PS USB0 is not enabled in
-       the block design. No software fix applies.
-
-  2. lsusb
-       Expect 0bda:2838 (Realtek RTL2838). If absent, check the cable
-       and that the dongle is in J13, the host port.
-
-  3. rtl_test -t
-       Proves librtlsdr can claim the device and identifies the tuner.
-       Should report R820T2 for a Blog V3. If it reports "device is
-       busy", the blacklist did not take -- check
-       /etc/modprobe.d/blacklist-rtl28xxu.conf exists.
-
-  4. gpiodetect
-       Confirm which gpiochip is 40000000.gpio (the PL one, ngpio=2).
-       fmdemod-rtlsdr assumes gpiochip0. Enumeration order is
-       probe-dependent and can change between kernels.
-
-  5. fmdemod-rtlsdr -f 100000000 -d 30
-
---------------------------------------------------------------------
-READING THE OUTPUT
---------------------------------------------------------------------
-The per-second progress line reports ring occupancy and loss:
-
-    [ 12s] refills=1200 blocks=24000 ring=79800/160000 under=0 over=0
-
-  ring hovering near half full   healthy
-  ring pinned at 0               fabric consuming faster than the SDR
-                                 delivers; expect underruns and gaps
-  ring pinned at maximum         SDR faster than the fabric, or the poll
-                                 loop is blocked (SD write stalls will
-                                 do it)
-  steady under=/over= growth     the two sample rates genuinely differ.
-                                 Jitter causes occasional single-digit
-                                 counts; a steady climb is a real rate
-                                 mismatch and worth measuring.
-
---------------------------------------------------------------------
-IF THE AUDIO IS MISTUNED
---------------------------------------------------------------------
-The tuner is offset by NCO_OFFSET_HZ (+10 kHz) so the station lands
-where the PL's fixed 10 kHz NCO expects it. That sign was derived from
-the freq_corr RTL, NOT measured on hardware. If audio is distorted or
-tuned to the wrong place, flip the sign in fmdemod-rtlsdr.c and rebuild
-before investigating anything else -- it is one character and the
-fastest hypothesis to eliminate.
-
-FINAL_EOF
+# ---- Optional SD card creation -----------------------------------------------
+# Deliberately NOT automatic -- create_sd.sh erases and repartitions
+# whatever device it is pointed at, needs root, and asks its own
+# interactive "type YES" confirmation. Offering it here rather than just
+# invoking it saves a manual step without ever silently touching a disk.
+CREATE_SD="${SCRIPT_DIR}/create_sd.sh"
+if [ -f "${CREATE_SD}" ]; then
+    echo ""
+    warn "Would you like to prepare an SD card now?"
+    echo "  Insert the micro SD card into your PC first."
+    echo ""
+    lsblk -d -o NAME,SIZE,TYPE,MODEL 2>/dev/null | grep -v loop || lsblk
+    echo ""
+    read -r -p "Enter SD card device (e.g. /dev/sdb), or press Enter to skip: " SD_DEV
+    if [ -n "${SD_DEV}" ]; then
+        if [ -b "${SD_DEV}" ]; then
+            # PETALINUX_PROJECT explicitly passed through -- create_sd.sh
+            # defaults it off $HOME, which sudo resets to /root (not your
+            # actual home), so without this it looks for the built images
+            # in the wrong place entirely and fails with a confusing
+            # "BOOT.BIN not found" even though the build genuinely
+            # succeeded.
+            sudo PETALINUX_PROJECT="${SCRIPT_DIR}/${PROJECT_NAME}" \
+                bash "${CREATE_SD}" "${SD_DEV}"
+        else
+            warn "Device ${SD_DEV} not found -- skipping. Prepare it manually:"
+            warn "  sudo PETALINUX_PROJECT=${SCRIPT_DIR}/${PROJECT_NAME} \\"
+            warn "      bash create_sd.sh /dev/sdX"
+        fi
+    else
+        info "Skipping SD card creation. Run manually when ready:"
+        info "  sudo PETALINUX_PROJECT=${SCRIPT_DIR}/${PROJECT_NAME} \\"
+        info "      bash create_sd.sh /dev/sdX"
+    fi
+fi
