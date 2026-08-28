@@ -166,15 +166,49 @@
 /* ------------------------------------------------------------------ */
 #define DEFAULT_STATION_HZ    100000000u  /* 100.0 MHz */
 #define NCO_OFFSET_HZ         10000       /* see TUNING note above */
-#define SDR_SAMPLE_RATE       250000u     /* matches the PL chain exactly */
+/* OVERSAMPLING FIX -- was 250000u (matching the PL chain exactly).
+ *
+ * Compared against Gqrx on the same dongle, same antenna, same
+ * location: Gqrx runs the RTL2832U at 1.8 Msps and gets a materially
+ * cleaner demodulated spectrum than this app captured at 250 kHz.
+ * This is a known RTL2832U characteristic, not guesswork -- the chip's
+ * own decimation filters ahead of the final output rate are weak, so
+ * sampling directly at a rate close to the target channel bandwidth
+ * (250 kHz for a ~200 kHz FM channel) gives the decimator very little
+ * oversampling margin to filter with, and more out-of-band noise
+ * aliases into the passband. At high input rates the decimator has
+ * real margin to work with.
+ *
+ * Fix: sample at SDR_INPUT_RATE (1.0 Msps -- a rate the RTL2832U
+ * handles cleanly, chosen as an exact multiple of the PL's 250 kHz so
+ * DECIM_FACTOR is a clean integer) and decimate by DECIM_FACTOR in
+ * this callback before the samples ever reach the ring buffer or the
+ * PL. Everything downstream of the ring -- refill_iq_buffer, the PL
+ * chain, the whole rest of this file -- is UNCHANGED and still runs at
+ * exactly 250 kHz; only the dongle's own sample rate changed.
+ *
+ * Decimator: first-order CIC (a running-sum moving-average, decimated).
+ * Deliberately NOT a higher-order CIC -- a 3rd-order CIC at this ratio
+ * has ~3.7 dB of droop by 75 kHz and ~6.8 dB by 100 kHz, eating into
+ * the same treble this fix is trying to recover. First-order droop is
+ * under 1.3 dB across the whole +-75 kHz FM channel, and aa_lpf
+ * downstream already does the real anti-alias filtering at its 100 kHz
+ * cutoff -- this decimator only needs to knock down what would
+ * otherwise alias from above the new, still-oversampled Nyquist, not
+ * shape the passband. */
+#define SDR_INPUT_RATE        1000000u    /* dongle's actual sample rate */
+#define DECIM_FACTOR           4u          /* 1.0 Msps / 4 = 250 kHz exactly */
+#define SDR_SAMPLE_RATE       (SDR_INPUT_RATE / DECIM_FACTOR)  /* 250000, unchanged downstream */
 #define SDR_DEVICE_INDEX      0
 
 /* librtlsdr async parameters. buf_len must be a multiple of 512.
- * 16384 bytes = 8192 I/Q pairs = ~32.8 ms at 250 kHz, which is about
- * 3.3 ping-pong buffers' worth. Smaller buffers cut latency but raise
- * the USB interrupt rate; on a 2-core A9 that trade matters. */
+ * Scaled up 4x from the original 250 kHz-era 16384 bytes to hold the
+ * same ~32.8 ms of audio at the new 1.0 Msps input rate (4x the byte
+ * rate for the same span of time), so USB interrupt rate and latency
+ * characteristics are unchanged from before this fix -- only the
+ * dongle's sample rate and the decimator are new. */
 #define SDR_ASYNC_BUF_NUM     16
-#define SDR_ASYNC_BUF_LEN     16384
+#define SDR_ASYNC_BUF_LEN     65536
 
 /* Ring buffer capacity in I/Q pairs. 64 ping-pong buffers = 160000
  * pairs = 640 ms at 250 kHz. Generous: it needs to cover USB scheduling
@@ -339,15 +373,68 @@ static inline uint32_t ring_count(void)
 /* ------------------------------------------------------------------ */
 /* librtlsdr async callback -- runs on the reader thread               */
 /* ------------------------------------------------------------------ */
+/* Decimator state -- persists across callback invocations, since a
+ * CIC's accumulator carries samples between USB buffer boundaries.
+ * Single producer (this callback, always on the reader thread), so no
+ * atomics needed on these -- they are never touched by the poll-loop
+ * thread. */
+static int32_t g_cic_i_acc = 0;
+static int32_t g_cic_q_acc = 0;
+static uint32_t g_cic_phase = 0;   /* counts 0..DECIM_FACTOR-1 */
+
 static void rtlsdr_cb(unsigned char *buf, uint32_t len, void *ctx)
 {
     (void)ctx;
 
-    uint32_t pairs = len / 2;   /* interleaved I,Q bytes */
+    uint32_t raw_pairs = len / 2;   /* interleaved I,Q bytes at SDR_INPUT_RATE */
+
+    /* Decimate first, into a small local buffer, THEN take the ring
+     * lock/space check. This keeps the ring's accounting (RING_PAIRS,
+     * overrun stats, refill_iq_buffer's expectations) entirely in
+     * terms of the FINAL 250 kHz rate, exactly as it was before this
+     * fix -- nothing downstream needs to know the dongle is now
+     * oversampling and decimating. */
+    static uint32_t decimated[SDR_ASYNC_BUF_LEN / 2];   /* worst case: DECIM_FACTOR=1 */
+    uint32_t n_decimated = 0;
+
+    for (uint32_t i = 0; i < raw_pairs; i++) {
+        /* unsigned 8-bit offset-128 -> signed, BEFORE the <<8 scale.
+         * Accumulate at this smaller scale so DECIM_FACTOR samples
+         * summed still fits comfortably in int32_t; the <<8 to reach
+         * sfix16_En15 is applied once, after decimation, below. */
+        int32_t Iu = (int32_t)buf[2 * i]     - 128;
+        int32_t Qu = (int32_t)buf[2 * i + 1] - 128;
+
+        g_cic_i_acc += Iu;
+        g_cic_q_acc += Qu;
+        g_cic_phase++;
+
+        if (g_cic_phase >= DECIM_FACTOR) {
+            /* First-order CIC = boxcar average, decimated: divide the
+             * sum of DECIM_FACTOR samples by DECIM_FACTOR, then apply
+             * the same <<8 scale rtlsdr_cb always used to map the
+             * 8-bit range into sfix16_En15. */
+            int16_t I = (int16_t)((g_cic_i_acc / (int32_t)DECIM_FACTOR) << 8);
+            int16_t Q = (int16_t)((g_cic_q_acc / (int32_t)DECIM_FACTOR) << 8);
+
+            decimated[n_decimated++] =
+                ((uint32_t)(uint16_t)I << 16) | (uint32_t)(uint16_t)Q;
+
+            g_cic_i_acc = 0;
+            g_cic_q_acc = 0;
+            g_cic_phase = 0;
+        }
+    }
+
+    if (n_decimated == 0) {
+        return;   /* can happen on a very short buffer; nothing to push yet */
+    }
+
     uint32_t h = __atomic_load_n(&g_ring_head, __ATOMIC_RELAXED);
     uint32_t t = __atomic_load_n(&g_ring_tail, __ATOMIC_ACQUIRE);
     uint32_t free_space = RING_PAIRS - (h - t);
 
+    uint32_t pairs = n_decimated;
     if (pairs > free_space) {
         /* Ring full: the fabric is not keeping up, or the poll loop is
          * blocked (an SD-card write stall will do it). Drop the excess
@@ -358,11 +445,7 @@ static void rtlsdr_cb(unsigned char *buf, uint32_t len, void *ctx)
     }
 
     for (uint32_t i = 0; i < pairs; i++) {
-        /* unsigned 8-bit offset-128 -> sfix16_En15 */
-        int16_t I = (int16_t)(((int16_t)buf[2 * i]     - 128) << 8);
-        int16_t Q = (int16_t)(((int16_t)buf[2 * i + 1] - 128) << 8);
-        g_ring[(h + i) % RING_PAIRS] =
-            ((uint32_t)(uint16_t)I << 16) | (uint32_t)(uint16_t)Q;
+        g_ring[(h + i) % RING_PAIRS] = decimated[i];
     }
 
     __atomic_store_n(&g_ring_head, h + pairs, __ATOMIC_RELEASE);
@@ -370,10 +453,14 @@ static void rtlsdr_cb(unsigned char *buf, uint32_t len, void *ctx)
 }
 
 /* ------------------------------------------------------------------ */
-/* Reader thread                                                       */
+/* Reader thread(s)                                                    */
 /* ------------------------------------------------------------------ */
 static rtlsdr_dev_t *g_dev;
 static volatile int   g_running = 1;
+
+/* File-replay mode global -- set by main() before the reader thread
+ * starts if -I <path> was given. NULL means "use the live dongle". */
+static const char *g_replay_path = NULL;
 
 static void *reader_thread(void *arg)
 {
@@ -385,6 +472,134 @@ static void *reader_thread(void *arg)
         fprintf(stderr, "rtlsdr_read_async returned %d unexpectedly\n", r);
     }
     g_running = 0;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------------
+ * File-replay reader thread.
+ * ---------------------------------------------------------------------
+ * Reads raw u8 I/Q from a file captured with:
+ *     rtl_sdr -f <freq> -s <SDR_INPUT_RATE> -n <count> capture.iq
+ * and feeds it through rtlsdr_cb() in SDR_ASYNC_BUF_LEN-sized chunks --
+ * the SAME function the live dongle path calls, so the decimator, the
+ * ring buffer, and everything downstream (refill_iq_buffer, the GPIO
+ * handshake with the PL, drain_audio_block, the WAV writer, the
+ * resampler) are IDENTICAL code paths to the live-capture run. Only
+ * the source of I/Q bytes differs.
+ *
+ * This exists to answer one specific question cheaply: if this app and
+ * ref_fm_demod.py (a separate, independent Python implementation) are
+ * given the EXACT SAME capture.iq file, do they produce comparable
+ * audio? If yes, the demodulator chain is validated and any remaining
+ * difference between a live Zybo run and a live Gqrx run is about the
+ * RF environment or the live capture path, not the demod math. If no,
+ * this isolates the disagreement to something in fmdemod-rtlsdr.c
+ * itself, independent of antenna, timing, or signal strength on the
+ * day.
+ *
+ * PACING: paced to real time, matching how a live dongle would have
+ * delivered these same bytes.
+ *
+ * AN EARLIER VERSION OF THIS FUNCTION HAD NO PACING -- it read and
+ * pushed the whole file as fast as disk I/O allowed. The ring buffer
+ * only holds RING_PAIRS pairs (a few hundred ms at SDR_INPUT_RATE), so
+ * a 10 second file arriving in a few tens of milliseconds overflowed
+ * it almost immediately: measured result was 2,187,500 of 2,500,000
+ * decimated pairs DROPPED as overruns, and the resulting WAV was only
+ * the first ~1.2 seconds of a 10 second capture -- silently truncated,
+ * not obviously wrong from the file just looking "kind of short". Any
+ * spectral comparison against ref_fm_demod.py's output (which DOES
+ * process the entire file) would have been comparing different spans
+ * of audio, not a fair test.
+ *
+ * Fixed by sleeping between chunks for the same span of time that
+ * chunk represents at SDR_INPUT_RATE -- i.e. behaving like a real
+ * 1 Msps source rather than a firehose. This makes a 10 second
+ * capture take ~10 seconds to replay, same as it would live, and the
+ * ring buffer never sees a burst larger than a live dongle could ever
+ * produce. -d/--duration is still ignored (the whole file is always
+ * processed, once, then the thread exits) -- pacing makes THAT
+ * meaningful too, since duration is now determined by the file's own
+ * length rather than being irrelevant.
+ * ------------------------------------------------------------------ */
+static void *file_replay_thread(void *arg)
+{
+    (void)arg;
+
+    FILE *fin = fopen(g_replay_path, "rb");
+    if (!fin) {
+        fprintf(stderr, "file_replay: fopen(%s) failed: %s\n",
+                g_replay_path, strerror(errno));
+        g_running = 0;
+        return NULL;
+    }
+
+    unsigned char *chunk = malloc(SDR_ASYNC_BUF_LEN);
+    if (!chunk) {
+        fprintf(stderr, "file_replay: malloc(%u) failed\n", SDR_ASYNC_BUF_LEN);
+        fclose(fin);
+        g_running = 0;
+        return NULL;
+    }
+
+    /* Time one full SDR_ASYNC_BUF_LEN chunk represents at the dongle's
+     * real sample rate: SDR_ASYNC_BUF_LEN bytes = SDR_ASYNC_BUF_LEN/2
+     * I/Q pairs, at SDR_INPUT_RATE pairs/sec. usleep() takes
+     * microseconds, hence the 1e6 factor. A short final chunk sleeps
+     * proportionally less, computed from its own actual byte count
+     * rather than always sleeping the full-chunk duration. */
+    const double us_per_full_chunk =
+        1e6 * (double)(SDR_ASYNC_BUF_LEN / 2) / (double)SDR_INPUT_RATE;
+
+    struct timespec t_start_ts;
+    clock_gettime(CLOCK_MONOTONIC, &t_start_ts);
+    uint64_t chunks_sent = 0;
+
+    uint64_t total_bytes = 0;
+    size_t n;
+    while (g_running && (n = fread(chunk, 1, SDR_ASYNC_BUF_LEN, fin)) > 0) {
+        /* rtlsdr_cb expects an even byte count (interleaved I,Q pairs).
+         * A short final read from the file could leave a dangling
+         * single byte; drop it rather than feed a half-sample in. */
+        if (n & 1) n -= 1;
+        if (n == 0) break;
+
+        rtlsdr_cb(chunk, (uint32_t)n, NULL);
+        total_bytes += n;
+        chunks_sent++;
+
+        /* Pace to real time: sleep until this chunk's own slice of
+         * elapsed wall-clock time has actually passed, measured against
+         * a single fixed start time rather than accumulating per-chunk
+         * sleep durations -- the latter drifts under scheduling jitter
+         * (each chunk's sleep error adds to the next), the former
+         * self-corrects every iteration. */
+        double target_us = us_per_full_chunk * (double)chunks_sent
+                            * ((double)n / (double)SDR_ASYNC_BUF_LEN);
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        double elapsed_us = 1e6 * (double)(now_ts.tv_sec - t_start_ts.tv_sec)
+                           + 1e-3 * (double)(now_ts.tv_nsec - t_start_ts.tv_nsec);
+        double sleep_us = target_us - elapsed_us;
+        if (sleep_us > 0) {
+            usleep((useconds_t)sleep_us);
+        }
+        /* sleep_us <= 0 means this chunk's processing already took
+         * longer than its real-time slice -- fall behind rather than
+         * try to catch up by bursting, which would just recreate the
+         * overrun problem this pacing exists to avoid. */
+    }
+
+    free(chunk);
+    fclose(fin);
+
+    printf("file_replay: consumed %llu bytes (%llu I/Q pairs) from %s "
+           "over %.2f s (paced to real time)\n",
+           (unsigned long long)total_bytes,
+           (unsigned long long)(total_bytes / 2), g_replay_path,
+           us_per_full_chunk * (double)chunks_sent / 1e6);
+
+    g_running = 0;   /* signals main's poll loop and priming wait to stop */
     return NULL;
 }
 
@@ -524,16 +739,34 @@ static void usage(const char *argv0)
         "Usage: %s [options]\n"
         "  -f <Hz>   station centre frequency   (default %u = %.1f MHz)\n"
         "  -g <dB>   tuner gain in dB, or -1 for AGC   (default -1)\n"
-        "  -d <sec>  capture duration, 0 = until Ctrl-C  (default 30)\n"
+        "  -d <sec>  capture duration, 0 = until Ctrl-C  (default 30,\n"
+        "            ignored in -I file-replay mode -- see below)\n"
         "  -i <n>    RTL-SDR device index       (default %d)\n"
         "  -p <ppm>  frequency correction in ppm (default 0)\n"
+        "  -I <path> FILE-REPLAY MODE: read raw u8 I/Q from a file\n"
+        "            instead of opening a live dongle. -f, -g, -p, -d\n"
+        "            and device selection are all ignored -- the file\n"
+        "            is assumed to already be at the tuned/decimated\n"
+        "            frequency and rate (SDR_INPUT_RATE, currently\n"
+        "            %u Hz) that a live run would have produced.\n"
+        "            Runs through the IDENTICAL decimator/ring-buffer/\n"
+        "            PL/WAV path as a live capture; only the source of\n"
+        "            bytes differs. Exists to compare this app's output\n"
+        "            against an independent reference demodulator (e.g.\n"
+        "            ref_fm_demod.py) on byte-for-byte identical input,\n"
+        "            eliminating the RF environment as a variable.\n"
+        "            Capture a compatible file with:\n"
+        "              rtl_sdr -f <freq+10kHz> -s %u -n <count> capture.iq\n"
         "  -h        this help\n"
         "\n"
         "The tuner is set to (station + %d Hz) to place the signal at\n"
         "-%d Hz in baseband, where the PL's fixed 10 kHz NCO moves it to\n"
-        "DC. If audio is mistuned, try flipping the sign of NCO_OFFSET_HZ.\n",
+        "DC. If audio is mistuned, try flipping the sign of NCO_OFFSET_HZ.\n"
+        "(In -I mode, the file must already be captured with this same\n"
+        "+10 kHz offset for the PL's fixed NCO to work correctly.)\n",
         argv0, DEFAULT_STATION_HZ, DEFAULT_STATION_HZ / 1e6,
-        SDR_DEVICE_INDEX, NCO_OFFSET_HZ, NCO_OFFSET_HZ);
+        SDR_DEVICE_INDEX, SDR_INPUT_RATE, SDR_INPUT_RATE,
+        NCO_OFFSET_HZ, NCO_OFFSET_HZ);
 }
 
 int main(int argc, char **argv)
@@ -543,6 +776,7 @@ int main(int argc, char **argv)
     int      duration_s  = 30;
     int      dev_index   = SDR_DEVICE_INDEX;
     int      ppm         = 0;
+    const char *replay_path = NULL;   /* -I <path>: file-replay mode */
 
     int devmem_fd = -1;
     volatile uint32_t *iq_ping = NULL, *iq_pong = NULL, *audio_dest = NULL;
@@ -555,17 +789,19 @@ int main(int argc, char **argv)
     int ret = 1;
     int opt;
 
-    while ((opt = getopt(argc, argv, "f:g:d:i:p:h")) != -1) {
+    while ((opt = getopt(argc, argv, "f:g:d:i:p:I:h")) != -1) {
         switch (opt) {
         case 'f': station_hz = (uint32_t)strtoul(optarg, NULL, 10); break;
         case 'g': gain_db    = atoi(optarg); break;
         case 'd': duration_s = atoi(optarg); break;
         case 'i': dev_index  = atoi(optarg); break;
         case 'p': ppm        = atoi(optarg); break;
+        case 'I': replay_path = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
     }
+    g_replay_path = replay_path;   /* visible to file_replay_thread() */
 
     printf("=== FM Demod live (RTL-SDR -> PL chain -> WAV) ===\n");
 
@@ -595,68 +831,86 @@ int main(int argc, char **argv)
 
     if (gpio_init() != 0) goto cleanup_gpio;
 
-    /* ---- RTL-SDR open and configure ---- */
-    {
-        int count = rtlsdr_get_device_count();
-        if (count <= 0) {
-            fprintf(stderr, "No RTL-SDR devices found.\n");
-            fprintf(stderr, "Check: (1) /sys/bus/usb/devices/ is non-empty "
-                    "(if empty, PS USB0 is not enabled in the PS7 config);\n"
-                    "       (2) dvb_usb_rtl28xxu is blacklisted;\n"
-                    "       (3) lsusb shows 0bda:2838.\n");
-            goto cleanup_gpio;
-        }
-        printf("Found %d RTL-SDR device(s); using index %d: %s\n",
-               count, dev_index, rtlsdr_get_device_name(dev_index));
-
-        if (rtlsdr_open(&g_dev, dev_index) != 0) {
-            fprintf(stderr, "rtlsdr_open(%d) failed: %s\n", dev_index, strerror(errno));
-            goto cleanup_gpio;
-        }
-    }
-
-    if (rtlsdr_set_sample_rate(g_dev, SDR_SAMPLE_RATE) != 0) {
-        fprintf(stderr, "rtlsdr_set_sample_rate(%u) failed\n", SDR_SAMPLE_RATE);
-        goto cleanup_sdr;
-    }
-    printf("Sample rate: %u Hz (actual %u Hz)\n",
-           SDR_SAMPLE_RATE, rtlsdr_get_sample_rate(g_dev));
-
-    if (ppm != 0 && rtlsdr_set_freq_correction(g_dev, ppm) < 0) {
-        fprintf(stderr, "Warning: rtlsdr_set_freq_correction(%d) failed\n", ppm);
-    }
-
-    {
-        uint32_t tuner_hz = (uint32_t)((int64_t)station_hz + NCO_OFFSET_HZ);
-        if (rtlsdr_set_center_freq(g_dev, tuner_hz) != 0) {
-            fprintf(stderr, "rtlsdr_set_center_freq(%u) failed\n", tuner_hz);
-            goto cleanup_sdr;
-        }
-        printf("Station:     %.4f MHz\n", station_hz / 1e6);
-        printf("Tuner:       %.4f MHz  (station %+d Hz, for the fixed 10 kHz NCO)\n",
-               rtlsdr_get_center_freq(g_dev) / 1e6, NCO_OFFSET_HZ);
-    }
-
-    if (gain_db < 0) {
-        rtlsdr_set_tuner_gain_mode(g_dev, 0);   /* 0 == automatic */
-        printf("Tuner gain:  AGC\n");
+    if (g_replay_path) {
+        /* ---- File-replay mode: skip the dongle entirely ---- */
+        printf("=== FILE-REPLAY MODE ===\n");
+        printf("Reading: %s\n", g_replay_path);
+        printf("Assumed input rate: %u Hz (must match how the file was\n"
+               "captured -- e.g. rtl_sdr -s %u)\n", SDR_INPUT_RATE, SDR_INPUT_RATE);
+        printf("Decimated by %u -> %u Hz to the PL, same as a live run.\n",
+               DECIM_FACTOR, SDR_SAMPLE_RATE);
+        printf("-f/-g/-p/-d/-i are all ignored in this mode.\n");
+        /* g_dev stays NULL. Every place downstream that guards on
+         * "if (g_dev)" before touching the dongle (cleanup, signal
+         * handler, rtlsdr_cancel_async calls) is therefore naturally a
+         * no-op in replay mode -- no separate cleanup path needed. */
     } else {
-        int gains[64];
-        int n = rtlsdr_get_tuner_gains(g_dev, gains);
-        int best = 0, i;
-        for (i = 0; i < n && i < 64; i++) {
-            if (abs(gains[i] - gain_db * 10) < abs(gains[best] - gain_db * 10)) {
-                best = i;
+        /* ---- RTL-SDR open and configure (live dongle) ---- */
+        {
+            int count = rtlsdr_get_device_count();
+            if (count <= 0) {
+                fprintf(stderr, "No RTL-SDR devices found.\n");
+                fprintf(stderr, "Check: (1) /sys/bus/usb/devices/ is non-empty "
+                        "(if empty, PS USB0 is not enabled in the PS7 config);\n"
+                        "       (2) dvb_usb_rtl28xxu is blacklisted;\n"
+                        "       (3) lsusb shows 0bda:2838.\n");
+                goto cleanup_gpio;
+            }
+            printf("Found %d RTL-SDR device(s); using index %d: %s\n",
+                   count, dev_index, rtlsdr_get_device_name(dev_index));
+
+            if (rtlsdr_open(&g_dev, dev_index) != 0) {
+                fprintf(stderr, "rtlsdr_open(%d) failed: %s\n", dev_index, strerror(errno));
+                goto cleanup_gpio;
             }
         }
-        rtlsdr_set_tuner_gain_mode(g_dev, 1);   /* 1 == manual */
-        if (n > 0) rtlsdr_set_tuner_gain(g_dev, gains[best]);
-        printf("Tuner gain:  %.1f dB (nearest supported to %d dB)\n",
-               (n > 0 ? gains[best] : 0) / 10.0, gain_db);
-    }
 
-    if (rtlsdr_reset_buffer(g_dev) != 0) {
-        fprintf(stderr, "Warning: rtlsdr_reset_buffer failed\n");
+        /* Set the DONGLE to SDR_INPUT_RATE (oversampled), not
+         * SDR_SAMPLE_RATE (the PL's rate) -- the decimator in rtlsdr_cb
+         * brings it down to SDR_SAMPLE_RATE before anything else sees it. */
+        if (rtlsdr_set_sample_rate(g_dev, SDR_INPUT_RATE) != 0) {
+            fprintf(stderr, "rtlsdr_set_sample_rate(%u) failed\n", SDR_INPUT_RATE);
+            goto cleanup_sdr;
+        }
+        printf("Sample rate: %u Hz dongle input (actual %u Hz), decimated by %u -> %u Hz to the PL\n",
+               SDR_INPUT_RATE, rtlsdr_get_sample_rate(g_dev), DECIM_FACTOR, SDR_SAMPLE_RATE);
+
+        if (ppm != 0 && rtlsdr_set_freq_correction(g_dev, ppm) < 0) {
+            fprintf(stderr, "Warning: rtlsdr_set_freq_correction(%d) failed\n", ppm);
+        }
+
+        {
+            uint32_t tuner_hz = (uint32_t)((int64_t)station_hz + NCO_OFFSET_HZ);
+            if (rtlsdr_set_center_freq(g_dev, tuner_hz) != 0) {
+                fprintf(stderr, "rtlsdr_set_center_freq(%u) failed\n", tuner_hz);
+                goto cleanup_sdr;
+            }
+            printf("Station:     %.4f MHz\n", station_hz / 1e6);
+            printf("Tuner:       %.4f MHz  (station %+d Hz, for the fixed 10 kHz NCO)\n",
+                   rtlsdr_get_center_freq(g_dev) / 1e6, NCO_OFFSET_HZ);
+        }
+
+        if (gain_db < 0) {
+            rtlsdr_set_tuner_gain_mode(g_dev, 0);   /* 0 == automatic */
+            printf("Tuner gain:  AGC\n");
+        } else {
+            int gains[64];
+            int n = rtlsdr_get_tuner_gains(g_dev, gains);
+            int best = 0, i;
+            for (i = 0; i < n && i < 64; i++) {
+                if (abs(gains[i] - gain_db * 10) < abs(gains[best] - gain_db * 10)) {
+                    best = i;
+                }
+            }
+            rtlsdr_set_tuner_gain_mode(g_dev, 1);   /* 1 == manual */
+            if (n > 0) rtlsdr_set_tuner_gain(g_dev, gains[best]);
+            printf("Tuner gain:  %.1f dB (nearest supported to %d dB)\n",
+                   (n > 0 ? gains[best] : 0) / 10.0, gain_db);
+        }
+
+        if (rtlsdr_reset_buffer(g_dev) != 0) {
+            fprintf(stderr, "Warning: rtlsdr_reset_buffer failed\n");
+        }
     }
 
     /* ---- Output WAV ---- */
@@ -674,8 +928,15 @@ int main(int argc, char **argv)
      * Entering the poll loop with an empty ring would produce a burst of
      * underruns and a click at the start of every capture. Half full is
      * an arbitrary but comfortable starting point: enough cushion to
-     * absorb early USB jitter without adding noticeable latency. */
-    if (pthread_create(&reader, NULL, reader_thread, NULL) != 0) {
+     * absorb early USB jitter without adding noticeable latency.
+     *
+     * file_replay_thread() fills the ring the same way rtlsdr_cb() does
+     * (it calls the same function), just from a file instead of USB, so
+     * this priming logic is unchanged for replay mode -- it will simply
+     * fill much faster since there's no USB scheduling to wait on. */
+    if (pthread_create(&reader, NULL,
+                        g_replay_path ? file_replay_thread : reader_thread,
+                        NULL) != 0) {
         fprintf(stderr, "pthread_create(reader) failed: %s\n", strerror(errno));
         goto cleanup_fout;
     }
@@ -689,8 +950,11 @@ int main(int argc, char **argv)
             waited_ms += 10;
         }
         if (ring_count() < IQ_BUF_SIZE_WORDS) {
-            fprintf(stderr, "No samples arriving from the SDR after %d ms. "
-                    "Check the USB link and the antenna.\n", waited_ms);
+            fprintf(stderr, "No samples arriving %s after %d ms. %s\n",
+                    g_replay_path ? "from the file" : "from the SDR", waited_ms,
+                    g_replay_path
+                        ? "Check the file path and that it isn't empty/truncated."
+                        : "Check the USB link and the antenna.");
             goto cleanup_thread;
         }
         printf("Ring primed: %u pairs (%.0f ms)\n",
@@ -707,7 +971,10 @@ int main(int argc, char **argv)
         goto cleanup_thread;
     }
 
-    if (duration_s > 0) {
+    if (g_replay_path) {
+        printf("Processing file (runs until the file is exhausted; "
+               "-d is ignored in replay mode)...\n");
+    } else if (duration_s > 0) {
         printf("Capturing for %d s (Ctrl-C to stop early)...\n", duration_s);
     } else {
         printf("Capturing until Ctrl-C...\n");
@@ -785,7 +1052,10 @@ int main(int argc, char **argv)
                        (unsigned long long)g_stat_overruns);
                 fflush(stdout);
             }
-            if (duration_s > 0 && (now - t_start) >= duration_s) {
+            /* In replay mode duration_s is ignored -- the loop exits
+             * because g_running goes false when file_replay_thread()
+             * runs out of file, checked at the top of this while(). */
+            if (!g_replay_path && duration_s > 0 && (now - t_start) >= duration_s) {
                 printf("Duration reached.\n");
                 break;
             }

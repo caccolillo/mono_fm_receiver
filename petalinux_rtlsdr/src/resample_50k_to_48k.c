@@ -88,6 +88,64 @@ static void deemph_75_to_50(int16_t *buf, int n)
     }
 }
 
+/* ---------------------------------------------------------------------
+ * High-frequency low-pass: match what Gqrx does for mono broadcast FM
+ * ---------------------------------------------------------------------
+ * Measured directly: an audio recording made in Gqrx (WFM mono, same
+ * dongle, same antenna, same station, same location) shows a sharp
+ * corner around 8-9 kHz -- flat below 5 kHz, then a real knee, down to
+ * -110 dB or lower by 9-10 kHz. This app's audio LPF (127-tap FIR in
+ * the PL, -3 dB at 14.8 kHz) is flat well past that point, so weak,
+ * noisy high-frequency content that Gqrx simply discards is passed
+ * through here and heard as excess hiss/roughness compared to Gqrx.
+ *
+ * This is NOT correcting an error -- the PL's audio LPF was measured
+ * and confirmed correct for a receiver meant to pass close to the full
+ * 15 kHz FM audio bandwidth. This filter is a DELIBERATE choice to
+ * trade bandwidth for perceived cleanliness on a weak signal, matching
+ * Gqrx's behaviour. Set HF_LPF_ENABLE to 0 to disable and get the full
+ * 15 kHz bandwidth back.
+ *
+ * 2nd-order Butterworth, fc = 8000 Hz, fs = 50000 Hz (same rate as the
+ * de-emphasis correction, applied before resampling for the same
+ * reason: these coefficients are only valid at 50 kHz). Chosen over a
+ * 1-pole design because a 1-pole filter at this cutoff is far too
+ * gentle to match what was measured (-3dB at fc but only -5dB by
+ * 15kHz); the 2nd-order response matches the sharper knee actually
+ * observed in the Gqrx reference recording.
+ *
+ * Implemented as a Direct Form II biquad -- the standard, numerically
+ * well-behaved structure for a 2nd-order IIR section.
+ * ------------------------------------------------------------------ */
+#define HF_LPF_ENABLE 1
+
+/* scipy.signal.butter(2, 8000, fs=50000, output='sos') */
+#define HF_LPF_B0   0.14532388
+#define HF_LPF_B1   0.29064777
+#define HF_LPF_B2   0.14532388
+#define HF_LPF_A1  -0.67102909
+#define HF_LPF_A2   0.25232463
+
+static void hf_lowpass_8k(int16_t *buf, int n)
+{
+    /* Direct Form II: single delay line w[], shared between the
+     * feedback (a) and feedforward (b) halves. */
+    double w1 = 0.0, w2 = 0.0;
+
+    for (int i = 0; i < n; i++) {
+        double x = (double)buf[i];
+        double w0 = x - HF_LPF_A1 * w1 - HF_LPF_A2 * w2;
+        double y  = HF_LPF_B0 * w0 + HF_LPF_B1 * w1 + HF_LPF_B2 * w2;
+
+        w2 = w1;
+        w1 = w0;
+
+        if (y >  32767.0) y =  32767.0;
+        if (y < -32768.0) y = -32768.0;
+        buf[i] = (int16_t)lround(y);
+    }
+}
+
 static int resample_core(const int16_t *in, int n_in,
                           int16_t *out, int max_out)
 {
@@ -217,6 +275,15 @@ int resample_wav_50k_to_48k(const char *in_path, const char *out_path)
     deemph_75_to_50(in_buf, n_in);
     printf("resample: applied 75us -> 50us de-emphasis correction "
            "(+3.5 dB max treble)\n");
+#endif
+
+#if HF_LPF_ENABLE
+    /* Applied AFTER de-emphasis correction and BEFORE resampling, same
+     * rate (50 kHz) the coefficients above were designed for. See the
+     * long comment above hf_lowpass_8k() for why this exists. */
+    hf_lowpass_8k(in_buf, n_in);
+    printf("resample: applied 8 kHz HF low-pass (matches Gqrx mono FM "
+           "bandwidth)\n");
 #endif
 
     max_out = (int)(((int64_t)n_in * RESAMP_L) / RESAMP_M) + 4;
