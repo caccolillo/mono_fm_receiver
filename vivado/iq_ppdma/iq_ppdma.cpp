@@ -98,6 +98,62 @@ void iq_ppdma(packed_iq_t *mem,
     // (one AXI read + two stream pushes, comfortably inside the
     // ~400-cycle budget even without pipelining).
 
+    // ---------------------------------------------------------------
+    // PACING FIX
+    // ---------------------------------------------------------------
+    // This block's natural per-invocation latency (one AXI read + two
+    // stream pushes) measured at 129 cycles in the synthesis report --
+    // 3.1x faster than the 400-cycle (250 kHz at 100 MHz) rate the rest
+    // of the design assumes. With ap_start tied permanently high (see
+    // block design), it was free-running at that natural ~129-cycle
+    // pace with nothing pacing it to the real input rate.
+    //
+    // Confirmed consequence, traced from bd.tcl: this block's
+    // active_buf output is wired DIRECTLY to the same GPIO channel
+    // software polls to decide when to refill a ping/pong buffer.
+    // Toggling 3.1x faster than intended means software's polling loop
+    // -- real gpiod syscalls, not PL clock cycles -- cannot keep up
+    // with a hardware signal changing every ~1.29us, so it misses most
+    // toggles, and this block sometimes flips to a buffer software has
+    // NOT yet finished refreshing, feeding fm_demod stale, repeated I/Q
+    // data rather than fresh samples. Measured on hardware: ~22%
+    // shortfall in downstream audio throughput and 47 scattered signal
+    // discontinuities across a ~7.75s capture, both consistent with
+    // intermittent stale-data reuse rather than either a clean uniform
+    // speedup or outright sample loss.
+    //
+    // FIX: pace this block's own per-invocation latency to genuinely
+    // match the assumed 250 kHz rate, via HLS's LATENCY constraint --
+    // NOT via any external gating signal.
+    //
+    // An EARLIER attempt paced this externally: a VHDL counter added in
+    // the block design, gating ap_start with a short pulse instead of
+    // tying it permanently high. That carried real, unverified risk
+    // around whether Vitis HLS's ap_ctrl_hs handshake reliably samples
+    // a short externally-generated ap_start pulse against this block's
+    // own ap_idle timing, and it measurably made things WORSE when
+    // tried on hardware (new failure mode: early exit, underrun
+    // explosion, not present before that attempt).
+    //
+    // This is a fundamentally different, lower-risk kind of fix: it
+    // changes NOTHING about ap_start/ap_done/ap_idle/ap_ready timing or
+    // any external wiring. ap_start stays tied permanently high, the
+    // exact same pattern already proven clean on audio_ppdma and on
+    // this block's own control protocol. Only the internal time between
+    // ap_start being sampled and ap_done firing changes, via a
+    // constraint the HLS scheduler is explicitly designed to honour,
+    // padding internally rather than depending on an externally-timed
+    // pulse landing correctly.
+    //
+    // NOT YET VERIFIED ON HARDWARE. csim has no timing model and cannot
+    // exercise this at all -- cosim, and the regenerated synthesis
+    // report's Interval figure, are what actually confirm this took
+    // effect. Before trusting this on hardware: re-run csynth and
+    // confirm the report now shows Interval close to 400 (not still
+    // 129); then run cosim against iq_ppdma_tb.cpp, the same way
+    // audio_ppdma's fix was verified, before rebuilding fm_demod.
+    #pragma HLS LATENCY min=400 max=400
+
     static ap_uint<1>  cur_buf = 0;   // 0 = ping, 1 = pong -- buffer being read
     static ap_uint<32> ridx    = 0;   // sample index within the current buffer
     static ap_uint<1>  active_buf_reg = 0;  // shadow register -- see comment below

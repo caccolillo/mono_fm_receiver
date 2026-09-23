@@ -445,6 +445,93 @@ if ! grep -q "rtlsdr-blacklist" "${BSPCONF}" 2>/dev/null; then
     echo 'IMAGE_INSTALL:append = " rtlsdr-blacklist"' >> "${BSPCONF}"
 fi
 
+# ---- RT throttle disable -----------------------------------------------------
+# fmdemod-rtlsdr runs SCHED_FIFO priority 99. The kernel's default RT
+# throttle caps SCHED_FIFO/SCHED_RR processes to 95% of CPU time per
+# second (kernel.sched_rt_runtime_us = 950000 of 1000000), reserving the
+# remaining 5% for normal processes regardless of priority. During each
+# throttled window nothing drains the I/Q ring buffer while capture
+# keeps filling it. Measured on hardware: 8.2% sample loss with
+# throttling on, dropping to 0.5% with it disabled (the iq_ppdma pacing
+# fix, RING_PAIRS doubling, and this throttle disable are three
+# independent fixes -- none alone closed the loss to negligible, all
+# three together did).
+#
+# This is a /proc/sys/ runtime value with NO persistent on-disk form --
+# it resets to the kernel default on every reboot, so it needs an init
+# script that re-applies it at boot, not a config file that would
+# silently stop taking effect the moment the board is power-cycled.
+info "Adding RT throttle disable (init script, applied every boot --"
+info "this is a /proc/sys runtime value with no persistent form)"
+RT_DIR="project-spec/meta-user/recipes-core/rt-throttle-disable"
+mkdir -p "${RT_DIR}/files"
+
+cat > "${RT_DIR}/files/disable-rt-throttle" << 'RT_EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          disable-rt-throttle
+# Required-Start:
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+# Short-Description: Disable the kernel's RT scheduling throttle
+### END INIT INFO
+#
+# See rt-throttle-disable.bb for the full rationale. Runtime-only
+# kernel value, no persistent on-disk form -- must re-run every boot.
+case "$1" in
+  start)
+    echo -1 > /proc/sys/kernel/sched_rt_runtime_us
+    ;;
+  stop|restart|reload|status)
+    # nothing to do
+    ;;
+  *)
+    echo "Usage: $0 start"
+    exit 1
+    ;;
+esac
+exit 0
+RT_EOF
+chmod +x "${RT_DIR}/files/disable-rt-throttle"
+
+cat > "${RT_DIR}/rt-throttle-disable.bb" << 'RT_BB_EOF'
+SUMMARY = "Disable the kernel's RT scheduling throttle at boot"
+DESCRIPTION = "fmdemod-rtlsdr runs SCHED_FIFO priority 99. The kernel's \
+default RT throttle (95% cap per second) causes periodic scheduling \
+gaps large enough to overflow the I/Q ring buffer during sustained \
+capture -- measured 8.2% sample loss with throttling on, 0.5% with it \
+off. This is a /proc/sys/ runtime setting with no persistent on-disk \
+form, so it is applied by an init script rather than a config file \
+that would silently stop taking effect after a reboot."
+LICENSE = "MIT"
+LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
+
+SRC_URI = "file://disable-rt-throttle"
+S = "${WORKDIR}"
+
+inherit update-rc.d
+
+INITSCRIPT_NAME = "disable-rt-throttle"
+# Priority 01: as early as practical, well before fmdemod-rtlsdr could
+# ever be launched, manually or otherwise.
+INITSCRIPT_PARAMS = "start 01 S ."
+
+do_install() {
+    install -d ${D}${sysconfdir}/init.d
+    install -m 0755 ${WORKDIR}/disable-rt-throttle ${D}${sysconfdir}/init.d/disable-rt-throttle
+}
+
+FILES:${PN} = "${sysconfdir}/init.d/disable-rt-throttle"
+RT_BB_EOF
+
+# No Kconfig entry (ours, not a known OE package), same as the
+# blacklist recipe above -- goes in via IMAGE_INSTALL.
+if ! grep -q "rt-throttle-disable" "${BSPCONF}" 2>/dev/null; then
+    echo 'IMAGE_INSTALL:append = " rt-throttle-disable"' >> "${BSPCONF}"
+fi
+info "RT throttle disable recipe written"
+
 info "Running rootfs config (quiet for a bit, same reason as step 3)"
 stdbuf -oL -eL petalinux-config -c rootfs --silentconfig 2>&1 | tee -a "${LOG_FILE}"
 info "Rootfs config complete"

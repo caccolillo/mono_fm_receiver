@@ -210,11 +210,29 @@
 #define SDR_ASYNC_BUF_NUM     16
 #define SDR_ASYNC_BUF_LEN     65536
 
-/* Ring buffer capacity in I/Q pairs. 64 ping-pong buffers = 160000
- * pairs = 640 ms at 250 kHz. Generous: it needs to cover USB scheduling
- * hiccups and any SD-card write stall in the drain path, both of which
- * can be tens of ms. */
-#define RING_PAIRS            (64u * IQ_BUF_SIZE_WORDS)
+/* Ring buffer capacity in I/Q pairs. 128 ping-pong buffers = 320000
+ * pairs = 1280 ms at 250 kHz.
+ *
+ * Doubled from the original 64x/640ms after measuring a steady,
+ * non-bursty ring overflow on hardware even with the kernel's RT
+ * throttling disabled (echo -1 > /proc/sys/kernel/sched_rt_runtime_us).
+ * With the iq_ppdma pacing fix in place (see iq_ppdma.cpp), the
+ * refill-to-audio-block RATIO was already correct (measured 9.97:1 and
+ * 9.99:1 against a 10:1 target across two runs) -- this headroom
+ * increase is about absorbing the poll loop's own per-iteration
+ * overhead (two GPIO syscalls, periodic time() calls for progress
+ * reporting) staying JUST slightly behind the true 250 kHz drain
+ * requirement over a sustained run, not a functional correctness bug.
+ *
+ * The margin was tight before this: priming alone consumes
+ * RING_PAIRS/2 (328 ms worth, at the original 640 ms capacity) before
+ * the poll loop even starts, leaving only ~312 ms of headroom for any
+ * cumulative drain-rate shortfall to be absorbed in. Doubling the
+ * capacity roughly doubles that headroom to ~950 ms while keeping the
+ * SAME priming FRACTION (RING_PAIRS/2), so priming itself also takes
+ * proportionally longer (~656 ms instead of ~328 ms) -- worth knowing
+ * if startup latency ever matters here. */
+#define RING_PAIRS            (128u * IQ_BUF_SIZE_WORDS)
 
 #define OUTPUT_WAV_PATH_50K   "audio_50k.wav"
 #define OUTPUT_WAV_PATH_48K   "audio_out.wav"

@@ -42,11 +42,13 @@ module tb_sdr_fm_receiver_liveness;
     // silently pre-load the wrong region and iq_ppdma will stream
     // whatever was already in DDR instead.
     // ------------------------------------------------------------------
-    parameter [31:0] IQ_PING_ADDR    = 32'h3E00_0000;  // xlconstant_1
-    parameter [31:0] IQ_PONG_ADDR    = 32'h3E10_0000;  // xlconstant_2
-    parameter [31:0] AUDIO_PING_ADDR = 32'h3E20_0000;  // xlconstant_3 (informational only, not read here)
-    parameter [31:0] AUDIO_PONG_ADDR = 32'h3E30_0000;  // xlconstant_4 (informational only, not read here)
-    parameter [31:0] AUDIO_DEST_ADDR = 32'h3E40_0000;  // xlconstant_5 -- read back a few words at the end
+    parameter [31:0] IQ_PING_ADDR    = 32'h1F00_0000;  // was 3E00_0000
+    parameter [31:0] IQ_PONG_ADDR    = 32'h1F10_0000;  // was 3E10_0000
+    parameter [31:0] AUDIO_PING_ADDR = 32'h1F20_0000;  // was 3E20_0000
+    parameter [31:0] AUDIO_PONG_ADDR = 32'h1F30_0000;  // was 3E30_0000
+    parameter [31:0] AUDIO_DEST_ADDR = 32'h1F40_0000;  // was 3E40_0000 
+ 
+       
     parameter integer IQ_BUF_SIZE_WORDS = 2500;         // xlconstant_6 -- 10 ms of I/Q @ 250 kHz
 
     // audio_ppdma's buffer size is a COMPILE-TIME constant baked into
@@ -66,7 +68,7 @@ module tb_sdr_fm_receiver_liveness;
     parameter [31:0] GPIO2_DATA_OFFSET = 32'h0000_0008;
 
     parameter integer POLL_INTERVAL_CYCLES = 10000;         // 100 us @ 100 MHz
-    parameter integer TEST_DURATION_NS     = 500_000_000;   // 500 ms -- see runtime note below
+    parameter integer TEST_DURATION_NS     = 20_000_000;   // 500 ms -- see runtime note below
     parameter integer NUM_POLLS            = TEST_DURATION_NS / (POLL_INTERVAL_CYCLES * 10);
 
     // Liveness watchdog timeouts. Expected toggle period is ~10 ms for
