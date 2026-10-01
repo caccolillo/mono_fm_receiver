@@ -65,3 +65,5 @@ petalinux_alsa_live/fm_rtlsdr_linux/*.log
 # which were also silently excluding PetaLinux's real project-spec/)
 *_proj/
 *_prj/
+vitis/RemoteSystemsTempFiles/
+vitis/fm_sd_card_prj_system/
