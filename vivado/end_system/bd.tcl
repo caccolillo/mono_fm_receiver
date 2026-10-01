@@ -267,7 +267,7 @@ proc create_root_design { parentCell } {
     CONFIG.PCW_DCI_PERIPHERAL_CLKSRC {DDR PLL} \
     CONFIG.PCW_DCI_PERIPHERAL_FREQMHZ {10.159} \
     CONFIG.PCW_DDR_PERIPHERAL_CLKSRC {DDR PLL} \
-    CONFIG.PCW_DDR_RAM_HIGHADDR {0x3FFFFFFF} \
+    CONFIG.PCW_DDR_RAM_HIGHADDR {0x1FFFFFFF} \
     CONFIG.PCW_ENET0_ENET0_IO {MIO 16 .. 27} \
     CONFIG.PCW_ENET0_GRP_MDIO_ENABLE {1} \
     CONFIG.PCW_ENET0_GRP_MDIO_IO {MIO 52 .. 53} \
@@ -659,8 +659,8 @@ proc create_root_design { parentCell } {
   connect_bd_net -net xlconstant_6_dout [get_bd_pins iq_ppdma_0/buf_size_words] [get_bd_pins xlconstant_6/dout]
 
   # Create address segments
-  assign_bd_address -offset 0x00000000 -range 0x40000000 -target_address_space [get_bd_addr_spaces audio_ppdma_0/Data_m_axi_gmem] [get_bd_addr_segs processing_system7_0/S_AXI_HP0/HP0_DDR_LOWOCM] -force
-  assign_bd_address -offset 0x00000000 -range 0x40000000 -target_address_space [get_bd_addr_spaces iq_ppdma_0/Data_m_axi_gmem] [get_bd_addr_segs processing_system7_0/S_AXI_HP0/HP0_DDR_LOWOCM] -force
+  assign_bd_address -offset 0x00000000 -range 0x20000000 -target_address_space [get_bd_addr_spaces audio_ppdma_0/Data_m_axi_gmem] [get_bd_addr_segs processing_system7_0/S_AXI_HP0/HP0_DDR_LOWOCM] -force
+  assign_bd_address -offset 0x00000000 -range 0x20000000 -target_address_space [get_bd_addr_spaces iq_ppdma_0/Data_m_axi_gmem] [get_bd_addr_segs processing_system7_0/S_AXI_HP0/HP0_DDR_LOWOCM] -force
   assign_bd_address -offset 0x40000000 -range 0x00010000 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs axi_gpio_0/S_AXI/Reg] -force
 
 

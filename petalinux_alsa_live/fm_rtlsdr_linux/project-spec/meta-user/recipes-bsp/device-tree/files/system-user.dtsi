@@ -1,0 +1,82 @@
+/include/ "system-conf.dtsi"
+/ {
+};
+
+/* ==================================================================
+ * Reserved memory for the ping-pong DDR buffers
+ * ==================================================================
+ * The PL DMA engines write these physical addresses directly, with no
+ * IOMMU and no knowledge of Linux. Carving them out of the kernel's
+ * allocator is what stops Linux handing the same pages to a process.
+ *
+ * 0x1F000000-0x1F4FFFFF, NOT the original 0x3E000000. On a 1 GB board
+ * the old addresses collide with U-Boot's own relocation area near the
+ * top of DDR, which produces
+ *     ** Reading file would overwrite reserved memory **
+ *     Failed to load 'image.ub'
+ * and the board never reaches the kernel at all.
+ *
+ * MUST match the xlconstant values in vivado/end_system/bd.tcl and the
+ * #defines in fmdemod-rtlsdr.c. Three places, all of which have to
+ * agree, and which have disagreed before.
+ * ================================================================== */
+/ {
+    reserved-memory {
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+
+        iq_ping_reserved: buffer@1f000000 {
+            no-map;
+            reg = <0x1F000000 0x00100000>; /* 1 MB */
+        };
+        iq_pong_reserved: buffer@1f100000 {
+            no-map;
+            reg = <0x1F100000 0x00100000>; /* 1 MB */
+        };
+        audio_ping_reserved: buffer@1f200000 {
+            no-map;
+            reg = <0x1F200000 0x00100000>; /* 1 MB */
+        };
+        audio_pong_reserved: buffer@1f300000 {
+            no-map;
+            reg = <0x1F300000 0x00100000>; /* 1 MB */
+        };
+        audio_dest_reserved: buffer@1f400000 {
+            no-map;
+            reg = <0x1F400000 0x00100000>; /* 1 MB */
+        };
+    };
+};
+
+/* ==================================================================
+ * PS USB0 host mode
+ * ==================================================================
+ * Zynq-7000's USB is a ChipIdea core driving an EXTERNAL ULPI PHY
+ * (USB3320 on the Zybo). DTG generates the controller node from the
+ * XSA, but the PHY is a board-level part the XSA knows nothing about,
+ * so its node has to be declared here by hand.
+ *
+ * Symptom when this is missing: dmesg shows usbcore and ehci_hcd
+ * registering normally, but /sys/bus/usb/devices/ is EMPTY -- there is
+ * no host controller instance for anything to attach to. That was the
+ * exact state on the first Linux boot of this design.
+ *
+ * This fragment alone is NOT sufficient: it references a usb0 node that
+ * only exists if PCW_USB0_PERIPHERAL_ENABLE is set in the block design.
+ * ================================================================== */
+/ {
+    usb_phy0: usb_phy@0 {
+        compatible = "ulpi-phy";
+        #phy-cells = <0>;
+        reg = <0xe0002000 0x1000>;
+        view-port = <0x0170>;
+        drv-vbus;
+    };
+};
+
+&usb0 {
+    status = "okay";
+    dr_mode = "host";
+    usb-phy = <&usb_phy0>;
+};
