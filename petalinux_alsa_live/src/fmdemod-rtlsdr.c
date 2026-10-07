@@ -138,6 +138,8 @@
 #include <gpiod.h>
 #include <rtl-sdr.h>
 
+#include "pl_rates.h"   /* measured PL rate and everything derived from it */
+
 /* ------------------------------------------------------------------ */
 /* DDR map -- MUST match reserved-memory.dtsi, bd.tcl's xlconstants,   */
 /* and vitis main.c. All five agree on 0x1F000000-0x1F4FFFFF.          */
@@ -165,7 +167,10 @@
 /* RTL-SDR defaults (all overridable on the command line)              */
 /* ------------------------------------------------------------------ */
 #define DEFAULT_STATION_HZ    100000000u  /* 100.0 MHz */
-#define NCO_OFFSET_HZ         10000       /* see TUNING note above */
+/* RATE FIX (2026-10-07): the NCO's phase increment is fixed, so its
+ * shift scales with the real sample rate -- 9241 Hz at the measured
+ * PL_IQ_RATE_HZ, not 10000. See pl_rates.h. */
+#define NCO_OFFSET_HZ         PL_NCO_SHIFT_HZ   /* see TUNING note above */
 /* OVERSAMPLING FIX -- was 250000u (matching the PL chain exactly).
  *
  * Compared against Gqrx on the same dongle, same antenna, same
@@ -208,12 +213,21 @@
  * does not need to be trusted anew.
  *
  * To re-enable oversampling later (e.g. if USB bandwidth turns out NOT
- * to be the cause after this test), set SDR_INPUT_RATE back to
- * 1000000u and DECIM_FACTOR back to 4u -- nothing else needs to
- * change. */
-#define SDR_INPUT_RATE         250000u    /* dongle's actual sample rate -- matches the PL directly, no oversampling */
+ * to be the cause after this test), set SDR_INPUT_RATE to
+ * (4u * PL_IQ_RATE_HZ) and DECIM_FACTOR back to 4u -- nothing else
+ * needs to change. (Was 1000000u before the 2026-10-07 rate fix.) */
+/* RATE FIX (2026-10-07): was 250000u. iq_ppdma measurably consumes
+ * I/Q at about 231,035 S/s on silicon (live, with -A), not 250,000 (AXI read latency through
+ * HP0, not something the LATENCY pragma can shorten -- see
+ * pl_rates.h). Sampling the dongle at 250 kHz fed it 8.2% faster than
+ * the PL could drain, which was the ~5.6% live-capture ring loss all
+ * along. The dongle now samples at exactly the rate the PL consumes.
+ *
+ * If oversampling is ever re-enabled, use 4 * PL_IQ_RATE_HZ with
+ * DECIM_FACTOR 4 (924140 Hz, inside the RTL2832U's valid range). */
+#define SDR_INPUT_RATE         PL_IQ_RATE_HZ    /* matches the PL's MEASURED consumption rate */
 #define DECIM_FACTOR                1u    /* no decimation -- see the revert note above */
-#define SDR_SAMPLE_RATE       (SDR_INPUT_RATE / DECIM_FACTOR)  /* 250000, unchanged downstream */
+#define SDR_SAMPLE_RATE       (SDR_INPUT_RATE / DECIM_FACTOR)  /* = PL_IQ_RATE_HZ */
 #define SDR_DEVICE_INDEX      0
 
 /* librtlsdr async parameters. buf_len must be a multiple of 512.
@@ -940,7 +954,7 @@ static void usage(const char *argv0)
         "  -A <dev>  live ALSA playback while capturing, e.g.\n"
         "            -A default  or  -A plughw:0,0 (must be a PLUG-\n"
         "            wrapped device name, not raw hw:X,Y -- the PL's\n"
-        "            native 50 kHz is almost certainly not one of the\n"
+        "            native audio rate is not one of the\n"
         "            dongle's supported hardware rates, and only the\n"
         "            plug layer does the software rate conversion).\n"
         "            Omit -A entirely to disable live playback (the\n"
@@ -959,17 +973,18 @@ static void usage(const char *argv0)
         "            ref_fm_demod.py) on byte-for-byte identical input,\n"
         "            eliminating the RF environment as a variable.\n"
         "            Capture a compatible file with:\n"
-        "              rtl_sdr -f <freq+10kHz> -s %u -n <count> capture.iq\n"
+        "              rtl_sdr -f <freq+offset> -s %u -n <count> capture.iq\n"
         "  -h        this help\n"
         "\n"
         "The tuner is set to (station + %d Hz) to place the signal at\n"
-        "-%d Hz in baseband, where the PL's fixed 10 kHz NCO moves it to\n"
+        "-%d Hz in baseband, where the PL's fixed-increment NCO moves it to\n"
         "DC. If audio is mistuned, try flipping the sign of NCO_OFFSET_HZ.\n"
         "(In -I mode, the file must already be captured with this same\n"
-        "+10 kHz offset for the PL's fixed NCO to work correctly.)\n",
+        "+%d Hz offset AND at %u Hz for the PL's fixed NCO to\n"
+        "work correctly; older 250 kHz captures will play ~7%% slow.)\n",
         argv0, DEFAULT_STATION_HZ, DEFAULT_STATION_HZ / 1e6,
         SDR_DEVICE_INDEX, SDR_INPUT_RATE, SDR_INPUT_RATE,
-        NCO_OFFSET_HZ, NCO_OFFSET_HZ);
+        NCO_OFFSET_HZ, NCO_OFFSET_HZ, NCO_OFFSET_HZ, SDR_INPUT_RATE);
 }
 
 int main(int argc, char **argv)
@@ -1084,7 +1099,7 @@ int main(int argc, char **argv)
 
         /* SDR_INPUT_RATE == SDR_SAMPLE_RATE now (oversampling reverted,
          * see the long comment at the top of the file) -- the dongle
-         * is set directly to the PL's own 250 kHz rate. */
+         * is set directly to the PL's measured rate (pl_rates.h). */
         if (rtlsdr_set_sample_rate(g_dev, SDR_INPUT_RATE) != 0) {
             fprintf(stderr, "rtlsdr_set_sample_rate(%u) failed\n", SDR_INPUT_RATE);
             goto cleanup_sdr;
@@ -1104,7 +1119,7 @@ int main(int argc, char **argv)
                 goto cleanup_sdr;
             }
             printf("Station:     %.4f MHz\n", station_hz / 1e6);
-            printf("Tuner:       %.4f MHz  (station %+d Hz, for the fixed 10 kHz NCO)\n",
+            printf("Tuner:       %.4f MHz  (station %+d Hz, for the fixed-increment NCO)\n",
                    rtlsdr_get_center_freq(g_dev) / 1e6, NCO_OFFSET_HZ);
         }
 
@@ -1137,7 +1152,11 @@ int main(int argc, char **argv)
         perror("fopen(" OUTPUT_WAV_PATH_50K ")");
         goto cleanup_sdr;
     }
-    if (wav_write_placeholder_header(fout, 50000, 1, 16) != 0) {
+    /* Declares the PL's REAL audio rate (46207 Hz), not the nominal
+     * 50 kHz: the file keeps its old name for compatibility with
+     * existing scripts, but any tool reading it now plays it at the
+     * correct speed. */
+    if (wav_write_placeholder_header(fout, PL_AUDIO_RATE_HZ, 1, 16) != 0) {
         fprintf(stderr, "Failed to write placeholder WAV header\n");
         goto cleanup_fout;
     }
@@ -1352,7 +1371,7 @@ int main(int argc, char **argv)
     }
     fclose(fout);
     fout = NULL;
-    printf("\n50 kHz WAV: %s (%u bytes)\n", OUTPUT_WAV_PATH_50K, total_audio_bytes);
+    printf("\n%u Hz WAV: %s (%u bytes)\n", PL_AUDIO_RATE_HZ, OUTPUT_WAV_PATH_50K, total_audio_bytes);
 
     printf("Resampling %s -> %s ...\n", OUTPUT_WAV_PATH_50K, OUTPUT_WAV_PATH_48K);
     if (resample_wav_50k_to_48k(OUTPUT_WAV_PATH_50K, OUTPUT_WAV_PATH_48K) == 0) {

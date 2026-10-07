@@ -6,9 +6,18 @@
  * unchanged. Only the FILE I/O primitives changed: FATFS (FIL/f_open/
  * f_read/f_write/FRESULT) -> plain POSIX (FILE *, fopen/fread/fwrite).
  * No FATFS/xilffs dependency remains in this file at all.
+ *
+ * RATE FIX (2026-10-07): the input is no longer 50 kHz. The PL really
+ * produces audio at PL_AUDIO_RATE_HZ (46,333 Hz, measured -- see
+ * pl_rates.h), so the resampler is now 107/103 (upsampling) instead of
+ * 24/25, and the de-emphasis and HF filter coefficients come from
+ * pl_rates.h, recomputed for the real rate. The file and function keep
+ * their old "50k" names so nothing calling them has to change; read
+ * "50k" below as "the PL's native rate".
  */
 
 #include "resample_coeffs.h"
+#include "pl_rates.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -45,9 +54,9 @@
  *     a50 = exp(-1/(fs*50e-6)) = 0.670320046035639
  *     g   = (1-a50)/(1-a75)    = 1.408457357294079
  *
- * Applied at 50 kHz, BEFORE resampling, because that is the rate the
- * PL filter was designed at and the rate these coefficients are valid
- * for. Doing it after resampling to 48 kHz would need different
+ * Applied at the PL's native rate, BEFORE resampling, because that is
+ * the rate the PL filter actually runs at and the rate these
+ * coefficients are computed for. Doing it after resampling to 48 kHz would need different
  * coefficients and would be correcting a signal that had already been
  * band-limited.
  *
@@ -63,9 +72,11 @@
  * ------------------------------------------------------------------ */
 #define DEEMPH_CORRECT 1
 
-#define DEEMPH_A75  0.765928338364649
-#define DEEMPH_A50  0.670320046035639
-#define DEEMPH_G    1.408457357294079
+/* DEEMPH_A75 / DEEMPH_A50 / DEEMPH_G now come from pl_rates.h. The
+ * values quoted above are the original 50 kHz ones; at the PL's real
+ * 46.207 kHz rate a50 = 0.6487 and g = 1.5010, and the PL's own pole is
+ * an effective 80.9 us rather than 75 us. The cancellation is still
+ * exact -- see pl_rates.h. */
 
 static void deemph_75_to_50(int16_t *buf, int n)
 {
@@ -78,7 +89,7 @@ static void deemph_75_to_50(int16_t *buf, int n)
         x_prev = x;
         y_prev = y;
 
-        /* Saturate. The correction has up to +3.5 dB of gain, so a
+        /* Saturate. The correction has up to +4.1 dB of gain at the real rate, so a
          * signal already near full scale can clip here. Wrapping would
          * be far worse than clipping -- a wrap is a full-scale
          * discontinuity that clicks. */
@@ -119,12 +130,9 @@ static void deemph_75_to_50(int16_t *buf, int n)
  * ------------------------------------------------------------------ */
 #define HF_LPF_ENABLE 1
 
-/* scipy.signal.butter(2, 8000, fs=50000, output='sos') */
-#define HF_LPF_B0   0.14532388
-#define HF_LPF_B1   0.29064777
-#define HF_LPF_B2   0.14532388
-#define HF_LPF_A1  -0.67102909
-#define HF_LPF_A2   0.25232463
+/* HF_LPF_* coefficients now come from pl_rates.h:
+ * scipy.signal.butter(2, 8000, fs=46207), i.e. recomputed for the
+ * PL's measured rate rather than the nominal 50 kHz quoted above. */
 
 static void hf_lowpass_8k(int16_t *buf, int n)
 {
@@ -223,7 +231,7 @@ static int wav_write_header(FILE *f, uint32_t sample_rate,
 }
 
 /*
- * File-level driver: reads a mono 16-bit PCM WAV at 50 kHz from
+ * File-level driver: reads a mono 16-bit PCM WAV at PL_AUDIO_RATE_HZ from
  * `in_path`, resamples to 48 kHz, writes it to `out_path`.
  * Returns 0 on success, -1 on failure.
  */
@@ -246,11 +254,15 @@ int resample_wav_50k_to_48k(const char *in_path, const char *out_path)
         fprintf(stderr, "resample: failed to read %s's WAV header\n", in_path);
         goto cleanup_fin;
     }
-    if (in_hdr.sample_rate != 50000 || in_hdr.bits_per_sample != 16 ||
+    /* Rejecting anything but PL_AUDIO_RATE_HZ is deliberate: an old
+     * 50000 Hz file would be resampled with the wrong ratio and come
+     * out 7.9% fast. Failing loudly beats silently wrong pitch. */
+    if (in_hdr.sample_rate != PL_AUDIO_RATE_HZ || in_hdr.bits_per_sample != 16 ||
         in_hdr.num_channels != 1) {
         fprintf(stderr, "resample: unexpected input format "
-                "(rate=%u bits=%u ch=%u), expected 50000/16/1\n",
-                in_hdr.sample_rate, in_hdr.bits_per_sample, in_hdr.num_channels);
+                "(rate=%u bits=%u ch=%u), expected %u/16/1\n",
+                in_hdr.sample_rate, in_hdr.bits_per_sample, in_hdr.num_channels,
+                PL_AUDIO_RATE_HZ);
         goto cleanup_fin;
     }
 
@@ -270,16 +282,16 @@ int resample_wav_50k_to_48k(const char *in_path, const char *out_path)
     fin = NULL;
 
 #if DEEMPH_CORRECT
-    /* Correct 75 us -> 50 us de-emphasis at the native 50 kHz rate,
+    /* Correct 75 us -> 50 us de-emphasis at the PL's native rate,
      * before any resampling. See the long comment above the function. */
     deemph_75_to_50(in_buf, n_in);
     printf("resample: applied 75us -> 50us de-emphasis correction "
-           "(+3.5 dB max treble)\n");
+           "(+4.1 dB max treble at the PL rate)\n");
 #endif
 
 #if HF_LPF_ENABLE
     /* Applied AFTER de-emphasis correction and BEFORE resampling, same
-     * rate (50 kHz) the coefficients above were designed for. See the
+     * rate (PL_AUDIO_RATE_HZ) the coefficients were computed for. See the
      * long comment above hf_lowpass_8k() for why this exists. */
     hf_lowpass_8k(in_buf, n_in);
     printf("resample: applied 8 kHz HF low-pass (matches Gqrx mono FM "
@@ -295,8 +307,8 @@ int resample_wav_50k_to_48k(const char *in_path, const char *out_path)
     }
 
     n_out = resample_core(in_buf, n_in, out_buf, max_out);
-    printf("resample: %d input samples (50k) -> %d output samples (48k)\n",
-           n_in, n_out);
+    printf("resample: %d input samples (%u Hz) -> %d output samples (48k), "
+           "L/M = %d/%d\n", n_in, PL_AUDIO_RATE_HZ, n_out, RESAMP_L, RESAMP_M);
 
     fout = fopen(out_path, "wb");
     if (!fout) {

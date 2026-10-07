@@ -12,8 +12,9 @@
 
 #include <stdint.h>
 
-/* Opens the ALSA PCM device for playback at the PL's NATIVE 50 kHz
- * rate. Deliberately does NOT reuse the file path's 50k->48k
+/* Opens the ALSA PCM device for playback at the PL's NATIVE rate,
+ * PL_AUDIO_RATE_HZ (46,333 Hz measured, nominally 50 kHz -- see
+ * pl_rates.h). Deliberately does NOT reuse the file path's 50k->48k
  * polyphase resampler -- that resampler resets its internal state
  * once per WHOLE FILE (correct there) and has no mechanism to carry
  * state across the 50-sample blocks a live stream actually arrives
@@ -36,7 +37,7 @@
 int alsa_live_init(const char *device_name);
 
 /* Feed one AUDIO_SAMPLES_PER_BUFFER (50-sample) block of native
- * 50 kHz PCM16 audio -- the SAME data just written to the WAV file,
+ * native-rate PCM16 audio -- the SAME data just written to the WAV file,
  * unmodified by this call (a local copy is filtered internally; the
  * caller's buffer, and therefore the WAV file output, is never
  * touched). Applies the same 75us->50us de-emphasis correction and

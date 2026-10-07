@@ -42,6 +42,7 @@
 #       ├── fmdemod-rtlsdr.c
 #       ├── resample_50k_to_48k.c
 #       ├── resample_coeffs.h
+#       ├── pl_rates.h               (measured PL rate + derived coefficients)
 #       ├── alsa_live.c              (live ALSA playback, -A flag)
 #       ├── alsa_live.h
 #       └── gpio_rate_test.c         (standalone GPIO toggle-rate diagnostic)
@@ -95,7 +96,7 @@ fi
 # Preflight the app sources before starting any petalinux work, so a
 # missing file fails immediately rather than halfway through a long build.
 for f in "fmdemod-rtlsdr.c" "resample_50k_to_48k.c" "resample_coeffs.h" \
-         "alsa_live.c" "alsa_live.h" "gpio_rate_test.c"; do
+         "pl_rates.h" "alsa_live.c" "alsa_live.h" "gpio_rate_test.c"; do
     if [ ! -f "${APP_SRC_DIR}/${f}" ]; then
         error "App source file not found: ${APP_SRC_DIR}/${f}\n\
 Expected directory layout:\n\
@@ -107,6 +108,7 @@ Expected directory layout:\n\
       ├── fmdemod-rtlsdr.c\n\
       ├── resample_50k_to_48k.c\n\
       ├── resample_coeffs.h\n\
+      ├── pl_rates.h\n\
       ├── alsa_live.c\n\
       └── alsa_live.h"
     fi
@@ -636,6 +638,7 @@ mkdir -p "${APP_FILES_DIR}"
 cp "${APP_SRC_DIR}/fmdemod-rtlsdr.c"      "${APP_FILES_DIR}/"
 cp "${APP_SRC_DIR}/resample_50k_to_48k.c" "${APP_FILES_DIR}/"
 cp "${APP_SRC_DIR}/resample_coeffs.h"     "${APP_FILES_DIR}/"
+cp "${APP_SRC_DIR}/pl_rates.h"            "${APP_FILES_DIR}/"
 cp "${APP_SRC_DIR}/alsa_live.c"           "${APP_FILES_DIR}/"
 cp "${APP_SRC_DIR}/alsa_live.h"           "${APP_FILES_DIR}/"
 cp "${APP_SRC_DIR}/gpio_rate_test.c"      "${APP_FILES_DIR}/"
@@ -694,6 +697,7 @@ SRC_URI = " \
     file://fmdemod-rtlsdr.c \
     file://resample_50k_to_48k.c \
     file://resample_coeffs.h \
+    file://pl_rates.h \
     file://alsa_live.c \
     file://alsa_live.h \
     file://gpio_rate_test.c \

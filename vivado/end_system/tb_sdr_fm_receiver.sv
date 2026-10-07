@@ -221,6 +221,93 @@ module tb_sdr_fm_receiver_liveness;
     integer      poll_idx, j, n_nonzero;
     reg   [31:0] rdata;
 
+    // ------------------------------------------------------------------
+    // DIAGNOSTIC: iq_ppdma_0 real per-invocation AXI read timing, and
+    // whether any stretching beyond its intended 400-cycle budget
+    // correlates with audio_ppdma_0 genuinely driving an AXI transaction
+    // on the SAME shared S_AXI_HP0 port at that exact moment.
+    // ------------------------------------------------------------------
+    // Added after ten prior measurements (scheduling, syscalls,
+    // bandwidth, poll-loop headroom, USB timing uniformity, and the PS7
+    // FCLK0 configuration decoded directly from ps7_init.tcl as an
+    // EXACT 100.000 MHz) all came back clean, yet gpio_rate_test.c
+    // measured iq_ppdma_0's real active_buf toggle rate at 92.70 Hz on
+    // actual silicon, not the intended 100 Hz. iq_ppdma_0 and
+    // audio_ppdma_0 share S_AXI_HP0 (bd.tcl's two assign_bd_address
+    // lines both target HP0_DDR_LOWOCM) -- this tests that sharing
+    // directly.
+    //
+    // An EARLIER version of this probe used ap_start/ap_idle via a
+    // guessed `.inst.` sub-hierarchy and silently measured nothing for
+    // nearly two hours of simulation -- the signals likely do not
+    // survive synthesis as observable nets at all, since ap_start is
+    // tied permanently high via an xlconstant and nothing downstream
+    // reads ap_idle/ap_done, so Vivado has no reason to keep them. This
+    // version instead measures off iq_ppdma_0's actual AXI4 read
+    // handshake (RVALID && RREADY, a completed data beat -- iq_ppdma
+    // does exactly one such read per invocation), using FLAT TOP-LEVEL
+    // WIRE NAMES confirmed present by grep against the real generated
+    // sdr_fm_receiver.v (Vivado's block-design wrapper flattens
+    // inter-IP connections to underscore-joined names at the
+    // dut.sdr_fm_receiver_i scope directly -- no .inst sub-hierarchy
+    // needed, unlike the earlier guess):
+    //   iq_ppdma_0_m_axi_gmem_RVALID / _RREADY         (confirmed present)
+    //   audio_ppdma_0_m_axi_gmem_{AR,R,AW,W,B}VALID/READY (confirmed present)
+    // If a future bd.tcl regeneration ever renames these (e.g. a second
+    // iq_ppdma instance becoming iq_ppdma_1), re-grep sim/sdr_fm_receiver.v
+    // for "_m_axi_gmem_" before trusting this unchanged.
+    wire iq_rd_beat    = dut.sdr_fm_receiver_i.iq_ppdma_0_m_axi_gmem_RVALID &&
+                          dut.sdr_fm_receiver_i.iq_ppdma_0_m_axi_gmem_RREADY;
+
+    wire audio_axi_active =
+        (dut.sdr_fm_receiver_i.audio_ppdma_0_m_axi_gmem_ARVALID && dut.sdr_fm_receiver_i.audio_ppdma_0_m_axi_gmem_ARREADY) ||
+        (dut.sdr_fm_receiver_i.audio_ppdma_0_m_axi_gmem_RVALID  && dut.sdr_fm_receiver_i.audio_ppdma_0_m_axi_gmem_RREADY)  ||
+        (dut.sdr_fm_receiver_i.audio_ppdma_0_m_axi_gmem_AWVALID && dut.sdr_fm_receiver_i.audio_ppdma_0_m_axi_gmem_AWREADY) ||
+        (dut.sdr_fm_receiver_i.audio_ppdma_0_m_axi_gmem_WVALID  && dut.sdr_fm_receiver_i.audio_ppdma_0_m_axi_gmem_WREADY)  ||
+        (dut.sdr_fm_receiver_i.audio_ppdma_0_m_axi_gmem_BVALID  && dut.sdr_fm_receiver_i.audio_ppdma_0_m_axi_gmem_BREADY);
+
+    longint unsigned iq_diag_cycle_count;
+    longint unsigned iq_diag_last_beat_cycle;
+    longint unsigned iq_diag_interval_count;
+    longint unsigned iq_diag_interval_sum;
+    longint unsigned iq_diag_interval_min;
+    longint unsigned iq_diag_interval_max;
+    longint unsigned iq_diag_stretch_count;              // intervals > 400 cycles
+    longint unsigned iq_diag_stretch_with_audio_active;   // of those, audio_ppdma was ALSO on the bus
+
+    initial begin
+        iq_diag_cycle_count               = 0;
+        iq_diag_last_beat_cycle           = 0;
+        iq_diag_interval_count            = 0;
+        iq_diag_interval_sum              = 0;
+        iq_diag_interval_min              = 64'hFFFF_FFFF_FFFF_FFFF;
+        iq_diag_interval_max              = 0;
+        iq_diag_stretch_count             = 0;
+        iq_diag_stretch_with_audio_active = 0;
+    end
+
+    always @(posedge `PS7.FCLK_CLK0) begin
+        iq_diag_cycle_count <= iq_diag_cycle_count + 1;
+
+        if (iq_rd_beat) begin
+            if (iq_diag_last_beat_cycle != 0) begin
+                automatic longint unsigned interval = iq_diag_cycle_count - iq_diag_last_beat_cycle;
+                iq_diag_interval_count = iq_diag_interval_count + 1;
+                iq_diag_interval_sum   = iq_diag_interval_sum + interval;
+                if (interval < iq_diag_interval_min) iq_diag_interval_min = interval;
+                if (interval > iq_diag_interval_max) iq_diag_interval_max = interval;
+
+                if (interval > 400) begin
+                    iq_diag_stretch_count = iq_diag_stretch_count + 1;
+                    if (audio_axi_active) begin
+                        iq_diag_stretch_with_audio_active = iq_diag_stretch_with_audio_active + 1;
+                    end
+                end
+            end
+            iq_diag_last_beat_cycle = iq_diag_cycle_count;
+        end
+    end
+
     initial begin
         $display("=== SDR FM Receiver -- Free-Running ppdma Liveness Test ===");
         $display("Test duration target: %0d ns (%.1f ms), %0d polls every %0d ns",
@@ -302,6 +389,42 @@ module tb_sdr_fm_receiver_liveness;
         $display("==================================================");
 
         #1000; $finish;
+    end
+
+    final begin
+        $display("==================================================");
+        $display("  iq_ppdma_0 real AXI timing / contention diagnostic");
+        $display("==================================================");
+        if (iq_diag_interval_count == 0) begin
+            $display("  No repeated RVALID&&RREADY beats observed -- these");
+            $display("  signal names were grep-confirmed present in the real");
+            $display("  generated sdr_fm_receiver.v, so an empty result here");
+            $display("  most likely means iq_ppdma genuinely never completed");
+            $display("  a read in this run (check DDR pre-load / reset timing)");
+            $display("  rather than a wrong path.");
+        end else begin
+            $display("  invocations measured: %0d", iq_diag_interval_count);
+            $display("  interval (cycles): min=%0d  max=%0d  avg=%0.1f  (design intent: 400)",
+                      iq_diag_interval_min, iq_diag_interval_max,
+                      real'(iq_diag_interval_sum) / real'(iq_diag_interval_count));
+            $display("  intervals > 400 cycles (\"stretched\"): %0d (%0.1f%% of all invocations)",
+                      iq_diag_stretch_count,
+                      100.0 * real'(iq_diag_stretch_count) / real'(iq_diag_interval_count));
+            if (iq_diag_stretch_count > 0) begin
+                $display("  of those, audio_ppdma_0 was ALSO driving an AXI");
+                $display("  transaction on the shared bus at that exact moment:");
+                $display("  %0d (%0.1f%% of stretched intervals)",
+                          iq_diag_stretch_with_audio_active,
+                          100.0 * real'(iq_diag_stretch_with_audio_active) / real'(iq_diag_stretch_count));
+                $display("  -- a HIGH percentage here directly supports the HP0");
+                $display("     bus-contention hypothesis; a LOW percentage rules");
+                $display("     it out and points elsewhere.");
+            end else begin
+                $display("  No stretched intervals observed -- iq_ppdma_0 stayed");
+                $display("  at its intended 400-cycle budget throughout this run.");
+            end
+        end
+        $display("==================================================");
     end
 
 endmodule

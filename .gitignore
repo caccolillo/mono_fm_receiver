@@ -60,6 +60,7 @@ petalinux_alsa_live/fm_rtlsdr_linux/images/
 petalinux_alsa_live/fm_rtlsdr_linux/.petalinux/
 petalinux_alsa_live/fm_rtlsdr_linux/cache/
 petalinux_alsa_live/fm_rtlsdr_linux/*.log
+*/project-spec/*
 
 # Vivado/HLS generated project directories (narrowed from *proj*/*prj*,
 # which were also silently excluding PetaLinux's real project-spec/)

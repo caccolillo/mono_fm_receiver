@@ -2,7 +2,7 @@
  * alsa_live.c
  *
  * See alsa_live.h for the overall design rationale (opening at the
- * PL's native 50 kHz via ALSA's own plug-layer resampler, rather than
+ * PL's native rate via ALSA's own plug-layer resampler, rather than
  * retrofitting the file path's polyphase resampler for streaming).
  *
  * ---------------------------------------------------------------------
@@ -31,7 +31,7 @@
  * always-non-blocking producer (a straight memcpy into a ring, worst
  * case a few atomic ops) -- it can no longer stall the poll loop no
  * matter what ALSA is doing. The new alsa_playback_thread is the
- * consumer: it pulls raw 50kHz samples off the ring, applies the
+ * consumer: it pulls raw native-rate samples off the ring, applies the
  * STATEFUL de-emphasis + HF filter (moved here from alsa_live_feed --
  * same math, same persistent state, just relocated to the thread that
  * now owns the whole playback path), and calls snd_pcm_writei(),
@@ -43,6 +43,7 @@
  * technique for what is structurally the same problem.
  */
 #include "alsa_live.h"
+#include "pl_rates.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,7 +62,7 @@
 #define ALSA_LATENCY_US   200000u
 
 /* Software ring between the poll loop (producer) and the playback
- * thread (consumer), in samples. 50000 = 1 second at 50 kHz --
+ * thread (consumer), in samples. 50000 = ~1.08 s at 46.2 kHz --
  * generous, matching the philosophy already used for g_ring: cheap in
  * memory, and a large margin against scheduling jitter on EITHER side
  * (the poll loop producing, or the playback thread's own transient
@@ -83,15 +84,11 @@
  * here as part of decoupling the poll loop from anything that could
  * block or take variable time.
  * ------------------------------------------------------------------ */
-#define DEEMPH_A75  0.765928338364649
-#define DEEMPH_A50  0.670320046035639
-#define DEEMPH_G    1.408457357294079
-
-#define HF_LPF_B0   0.14532388
-#define HF_LPF_B1   0.29064777
-#define HF_LPF_B2   0.14532388
-#define HF_LPF_A1  -0.67102909
-#define HF_LPF_A2   0.25232463
+/* RATE FIX (2026-10-07): DEEMPH_* and HF_LPF_* now come from
+ * pl_rates.h, shared with resample_50k_to_48k.c and recomputed for
+ * the PL's MEASURED 46,333 Hz audio rate. The filter STATE stays
+ * separate per module, for the reason above; only the constants are
+ * shared, so the two paths can no longer drift apart numerically. */
 
 static double g_deemph_x_prev = 0.0;
 static double g_deemph_y_prev = 0.0;
@@ -268,7 +265,7 @@ int alsa_live_init(const char *device_name)
                 dev, snd_strerror(err));
         fprintf(stderr, "alsa_live_init: use a PLUG-wrapped device name "
                 "(\"default\" or \"plughw:X,Y\"), not a raw \"hw:X,Y\" -- "
-                "the PL's native 50 kHz rate almost certainly is not one "
+                "the PL's native audio rate is not one "
                 "of the dongle's supported hardware rates, and only the "
                 "plug layer does the software rate conversion.\n");
         free(g_audio_ring);
@@ -281,7 +278,7 @@ int alsa_live_init(const char *device_name)
                               SND_PCM_FORMAT_S16_LE,
                               SND_PCM_ACCESS_RW_INTERLEAVED,
                               1,           /* mono */
-                              50000,       /* PL's native rate */
+                              PL_AUDIO_RATE_HZ,  /* PL's MEASURED native rate */
                               1,           /* soft_resample */
                               ALSA_LATENCY_US);
     if (err < 0) {
@@ -321,9 +318,9 @@ int alsa_live_init(const char *device_name)
         return -1;
     }
 
-    printf("alsa_live: opened %s for playback at 50000 Hz mono "
+    printf("alsa_live: opened %s for playback at %u Hz mono "
            "(ALSA converts to the hardware's native rate), playback "
-           "thread started\n", dev);
+           "thread started\n", dev, PL_AUDIO_RATE_HZ);
 
     return 0;
 }
